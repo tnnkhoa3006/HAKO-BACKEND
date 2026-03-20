@@ -2,180 +2,287 @@ import Post from '../models/post.model.js';
 import Comment from '../models/comment.model.js';
 import User from '../models/user.model.js';
 import Story from '../models/story.model.js';
+import mongoose from 'mongoose';
 import { archiveExpiredStories } from '../helper/ScanStory.js';
 import { generateRandomUser } from '../helper/buffAdmin.js';
 import { generateBuffUserPostsHome } from '../helper/buffUserPostHome.js';
 import Interaction from '../models/interaction.model.js';
 
+// ====== HELPER: Pseudo-random shuffle dựa trên user seed ======
+const getUserSeed = (userId) => {
+  const str = userId.toString();
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const chr = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + chr;
+    hash = hash & hash;
+  }
+  return Math.abs(hash);
+};
+
+const seededShuffle = (array, seed) => {
+  const shuffled = [...array];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const pseudoRandom = Math.sin(seed + i) * 10000;
+    const j = Math.floor((pseudoRandom - Math.floor(pseudoRandom)) * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+};
+// ====== END HELPER ======
+
+// ====== HELPER: Đếm comment/reply cho nhiều bài viết bằng 1 aggregate (fix N+1) ======
+const getCommentCountsForPosts = async (postIds) => {
+  if (!postIds || postIds.length === 0) return new Map();
+
+  const results = await Comment.aggregate([
+    { $match: { post: { $in: postIds } } },
+    {
+      $group: {
+        _id: { post: '$post', isReply: { $cond: [{ $ne: ['$parentId', null] }, true, false] } },
+        count: { $sum: 1 }
+      }
+    }
+  ]);
+
+  // Map postId -> { commentCount, replyCount }
+  const countMap = new Map();
+  for (const r of results) {
+    const pid = r._id.post.toString();
+    if (!countMap.has(pid)) countMap.set(pid, { commentCount: 0, replyCount: 0 });
+    if (r._id.isReply) {
+      countMap.get(pid).replyCount = r.count;
+    } else {
+      countMap.get(pid).commentCount = r.count;
+    }
+  }
+  return countMap;
+};
+// ====== END HELPER ======
+
+// ====== HELPER: Tính điểm time decay theo kiểu Facebook ======
+// Bài càng mới càng điểm cao, giảm dần theo giờ
+const getRecencyScore = (createdAt) => {
+  const ageInHours = (Date.now() - new Date(createdAt).getTime()) / (1000 * 60 * 60);
+  // Decay exponential: điểm giảm 50% mỗi 24 giờ
+  return Math.pow(0.97, ageInHours);
+};
+// ====== END HELPER ======
+
+// ====== HELPER: Format post với likes/comments/isLike/engagement/hasStories ======
+const formatPost = (post, loggedInUserId, countMap, usersWithStoriesSet) => {
+  const likesArr = Array.isArray(post.likes) ? post.likes.map(id => id?.toString()) : [];
+  const isLike = loggedInUserId ? likesArr.includes(loggedInUserId.toString()) : false;
+
+  const pid = post._id.toString();
+  const counts = countMap.get(pid) || { commentCount: 0, replyCount: 0 };
+
+  // Bài của khoatnn_6: buff số liệu
+  if (post.author?.username === 'khoatnn_6') {
+    const buffedLikes = typeof post.buffedLikes === 'number' ? post.buffedLikes : 200000 + Math.floor(Math.random() * 300000);
+    const buffedCommentCount = typeof post.buffedCommentCount === 'number' ? post.buffedCommentCount : Math.floor(Math.random() * 100000) + 200000;
+    const buffedReplyCount = typeof post.buffedReplyCount === 'number' ? post.buffedReplyCount : Math.floor(Math.random() * 50000) + 100000;
+    const totalLikes = buffedLikes + likesArr.length;
+    const totalComments = buffedCommentCount + buffedReplyCount;
+
+    return {
+      ...post,
+      likes: totalLikes,
+      realLikes: likesArr.length,
+      isBuffed: true,
+      buffedLikes,
+      commentCount: buffedCommentCount,
+      replyCount: buffedReplyCount,
+      totalComments,
+      totalLikes,
+      engagement: { likes: totalLikes, comments: totalComments, total: totalLikes + totalComments },
+      isLike,
+      hasStories: usersWithStoriesSet.has(post.author._id.toString())
+    };
+  }
+
+  // Bài thường
+  const totalLikes = likesArr.length;
+  const totalComments = counts.commentCount + counts.replyCount;
+  return {
+    ...post,
+    likes: totalLikes,
+    totalLikes,
+    isBuffed: false,
+    commentCount: counts.commentCount,
+    replyCount: counts.replyCount,
+    totalComments,
+    engagement: { likes: totalLikes, comments: totalComments, total: totalLikes + totalComments },
+    isLike,
+    hasStories: post.author ? usersWithStoriesSet.has(post.author._id.toString()) : false
+  };
+};
+// ====== END HELPER ======
+
+// ====== HELPER: Lưu buffedLikes/Comments vào DB nếu chưa có (batch) ======
+const ensureBuffedMetrics = async (posts) => {
+  const updates = [];
+  for (const post of posts) {
+    if (post.author?.username !== 'khoatnn_6') continue;
+    const updateObj = {};
+    if (typeof post.buffedLikes !== 'number') {
+      post.buffedLikes = 200000 + Math.floor(Math.random() * 300000);
+      updateObj.buffedLikes = post.buffedLikes;
+    }
+    if (typeof post.buffedCommentCount !== 'number') {
+      post.buffedCommentCount = Math.floor(Math.random() * 100000) + 200000;
+      updateObj.buffedCommentCount = post.buffedCommentCount;
+    }
+    if (typeof post.buffedReplyCount !== 'number') {
+      post.buffedReplyCount = Math.floor(Math.random() * 50000) + 100000;
+      updateObj.buffedReplyCount = post.buffedReplyCount;
+    }
+    if (Object.keys(updateObj).length > 0) {
+      updates.push(Post.findByIdAndUpdate(post._id, updateObj));
+    }
+  }
+  if (updates.length > 0) await Promise.all(updates);
+};
+// ====== END HELPER ======
+
+
+// ============================================================
+//  getPostHome — Feed cơ bản (fallback khi chưa có interaction)
+//  Ưu tiên: khoatnn_6 → người đang follow → shuffle với bài lạ
+// ============================================================
 export const getPostHome = async (req, res) => {
   try {
-    // Lấy page và limit từ query, mặc định page=1, limit=10
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
+    const loggedInUserId = req.user?.id;
 
-    // Lấy toàn bộ bài thật
-    let posts = await Post.find()
+    // 1. Lấy danh sách following của user đang đăng nhập
+    let followingIds = [];
+    if (loggedInUserId) {
+      const currentUser = await User.findById(loggedInUserId).select('following').lean();
+      followingIds = currentUser?.following?.map(id => id.toString()) || [];
+    }
+
+    // 2. Lấy bài của user đang theo dõi (ưu tiên 1)
+    const followingObjectIds = followingIds.map(id => new mongoose.Types.ObjectId(id));
+    const followingPosts = await Post.find(
+      followingIds.length > 0 ? { author: { $in: followingObjectIds } } : {}
+    )
       .populate('author', 'username profilePicture fullName checkMark')
       .sort({ createdAt: -1 })
       .lean();
 
-    const loggedInUserId = req.user?.id;
+    // 3. Lấy bài của người chưa follow (ưu tiên sau)
+    const otherPosts = await Post.find(
+      followingIds.length > 0
+        ? { author: { $nin: [...followingObjectIds, new mongoose.Types.ObjectId(loggedInUserId)] } }
+        : {}
+    )
+      .populate('author', 'username profilePicture fullName checkMark')
+      .sort({ createdAt: -1 })
+      .lean();
 
-    // Lấy danh sách userId có story còn hạn
-    const now = new Date();
-    const usersWithStories = await Story.distinct('author', {
-      isArchived: false,
-      expiresAt: { $gt: now }
+    // 4. Gộp và loại trùng
+    const allRealPosts = [...followingPosts, ...otherPosts];
+    const seenIds = new Set();
+    const dedupedPosts = allRealPosts.filter(p => {
+      const id = p._id.toString();
+      if (seenIds.has(id)) return false;
+      seenIds.add(id);
+      return true;
     });
+
+    // 5. Đảm bảo số liệu buff cho khoatnn_6
+    await ensureBuffedMetrics(dedupedPosts);
+
+    // 6. Lấy users có story + đếm comment một lần (fix N+1)
+    const now = new Date();
+    const usersWithStories = await Story.distinct('author', { isArchived: false, expiresAt: { $gt: now } });
     const usersWithStoriesSet = new Set(usersWithStories.map(id => id.toString()));
 
-    // Xử lý bài viết thật (giữ nguyên logic cũ của bạn)
-    const processedPosts = await Promise.all(posts.map(async post => {
-      const likesArr = Array.isArray(post.likes) ? post.likes.map(id => id?.toString()) : [];
-      let isLike = false;
-      if (loggedInUserId && likesArr.length > 0) {
-        isLike = likesArr.includes(loggedInUserId.toString());
-      }
-      if (post.author.username === 'khoatnn_6') {
-        let buffedLikes = post.buffedLikes;
-        if (typeof buffedLikes !== 'number') {
-          buffedLikes = 200000 + Math.floor(Math.random() * 300000);
-          await Post.findByIdAndUpdate(post._id, { buffedLikes });
-        }
-        let buffedCommentCount = post.buffedCommentCount;
-        let buffedReplyCount = post.buffedReplyCount;
-        let updateObj = {};
-        if (typeof buffedCommentCount !== 'number') {
-          buffedCommentCount = Math.floor(Math.random() * 100000) + 200000;
-          updateObj.buffedCommentCount = buffedCommentCount;
-        }
-        if (typeof buffedReplyCount !== 'number') {
-          buffedReplyCount = Math.floor(Math.random() * 50000) + 100000;
-          updateObj.buffedReplyCount = buffedReplyCount;
-        }
-        if (Object.keys(updateObj).length > 0) {
-          await Post.findByIdAndUpdate(post._id, updateObj);
-        }
-        const totalLikes = (buffedLikes || 0) + likesArr.length;
-        const totalComments = (buffedCommentCount || 0) + (buffedReplyCount || 0);
-        return {
-          ...post,
-          likes: totalLikes,
-          realLikes: likesArr.length,
-          isBuffed: true,
-          buffedLikes: buffedLikes,
-          commentCount: buffedCommentCount,
-          replyCount: buffedReplyCount,
-          totalComments: totalComments,
-          totalLikes: totalLikes,
-          engagement: {
-            likes: totalLikes,
-            comments: totalComments,
-            total: totalLikes + totalComments
-          },
-          isLike: isLike,
-          hasStories: usersWithStoriesSet.has(post.author._id.toString())
-        };
-      }
-      const commentCount = await Comment.countDocuments({
-        post: post._id,
-        parentId: null
-      });
-      const replyCount = await Comment.countDocuments({
-        post: post._id,
-        parentId: { $ne: null }
-      });
-      return {
-        ...post,
-        commentCount,
-        replyCount,
-        totalComments: commentCount + replyCount,
-        likes: post.likes?.length || 0,
-        totalLikes: post.likes?.length || 0,
-        isBuffed: false,
-        engagement: {
-          likes: post.likes?.length || 0,
-          comments: commentCount + replyCount,
-          total: (post.likes?.length || 0) + commentCount + replyCount
-        },
-        isLike: isLike,
-        hasStories: usersWithStoriesSet.has(post.author._id.toString())
-      };
-    }));
+    const realPostIds = dedupedPosts.map(p => p._id);
+    const countMap = await getCommentCountsForPosts(realPostIds);
 
-    // ====== TẠO BÀI VIẾT ẢO - FIX DUPLICATE KEYS ======
+    // 7. Format posts
+    const processedPosts = dedupedPosts.map(post =>
+      formatPost(post, loggedInUserId, countMap, usersWithStoriesSet)
+    );
+
+    // 8. Bài ảo (fake posts)
     if (!global._FAKE_USERS) {
       global._FAKE_USERS = Array.from({ length: 100 }, (_, i) => generateRandomUser(i));
     }
-    // Không random lại nữa, chỉ tạo 1 lần duy nhất
-    const fakeUsers = global._FAKE_USERS;
-    // Sử dụng hàm generateBuffUserPostsHome mới để tạo fakePosts động với ảnh từ Unsplash
     if (!global._FAKE_POSTS) {
       global._FAKE_POSTS = await generateBuffUserPostsHome(100);
     }
     const fakePosts = global._FAKE_POSTS;
 
-    // ====== ƯU TIÊN: khoatnn_6 > user thật > user ảo ======
-    // 1. Ưu tiên bài của khoatnn_6 lên đầu
-    const vanlocPosts = processedPosts.filter(p => p.author?.username === 'khoatnn_6');
-    // 2. Các bài user thật còn lại
-    const realPosts = processedPosts.filter(p => p.author?.username !== 'khoatnn_6');
-    // 3. Bài ảo
-    let allPosts = [...vanlocPosts, ...realPosts, ...fakePosts];
+    // 9. Phân loại: khoatnn_6 → following → others (shuffle) → fake (shuffle)
+    const vanlocPosts = processedPosts.filter(p => p.author?.username === 'khoatnn_6')
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    const followingProcessed = processedPosts.filter(
+      p => p.author?.username !== 'khoatnn_6' && followingIds.includes(p.author?._id?.toString())
+    );
+    const otherProcessed = processedPosts.filter(
+      p => p.author?.username !== 'khoatnn_6' && !followingIds.includes(p.author?._id?.toString())
+    );
 
-    // 4. Sắp xếp: tất cả bài của khoatnn_6 lên đầu (theo thời gian mới nhất), sau đó user thật (theo thời gian mới nhất), cuối cùng là ảo (theo thời gian mới nhất)
-    allPosts.sort((a, b) => {
-      const isVanlocA = a.author?.username === 'khoatnn_6';
-      const isVanlocB = b.author?.username === 'khoatnn_6';
-      if (isVanlocA && !isVanlocB) return -1;
-      if (!isVanlocA && isVanlocB) return 1;
-      // Nếu cùng là khoatnn_6 hoặc cùng không phải, sort theo thời gian mới nhất
-      if (!a.isFake && b.isFake) return -1;
-      if (a.isFake && !b.isFake) return 1;
-      return new Date(b.createdAt) - new Date(a.createdAt);
-    });
+    const userSeed = loggedInUserId ? getUserSeed(loggedInUserId) : Math.floor(Math.random() * 100000);
 
-    // ====== ÁP DỤNG PHÂN TRANG ======
+    // Shuffle others + fake để đa dạng, nhưng giữ following theo thứ tự thời gian
+    const shuffledOthers = seededShuffle([...otherProcessed, ...fakePosts], userSeed);
+
+    // Kết hợp cuối: khoatnn_6 → following (thời gian) → shuffled (others + fake)
+    const allPosts = [...vanlocPosts, ...followingProcessed, ...shuffledOthers];
+
+    // 10. Phân trang
     const totalPosts = allPosts.length;
     const startIndex = (page - 1) * limit;
-    const endIndex = startIndex + limit;
-    const paginatedPosts = allPosts.slice(startIndex, endIndex);
-    const hasMore = endIndex < totalPosts;
+    const paginatedPosts = allPosts.slice(startIndex, startIndex + limit);
+    const hasMore = startIndex + limit < totalPosts;
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       posts: paginatedPosts,
       total: totalPosts,
-      page: page,
-      limit: limit,
-      hasMore: hasMore,
+      page,
+      limit,
+      hasMore,
       totalPages: Math.ceil(totalPosts / limit)
     });
   } catch (error) {
     console.error('Lỗi khi lấy bài viết trang chủ:', error);
-    res.status(500).json({ success: false, message: 'Lỗi máy chủ' });
+    return res.status(500).json({ success: false, message: 'Lỗi máy chủ' });
   }
 };
 
-// Gợi ý bài viết dựa trên lịch sử tương tác (like/comment/follow)
+
+// ============================================================
+//  getRecommendedPosts — Feed thông minh (Facebook-like)
+//  Ưu tiên: khoatnn_6 → following + tương tác + AI topic + time decay
+//  Có phân trang đầy đủ
+// ============================================================
 export const getRecommendedPosts = async (req, res) => {
   try {
     const loggedInUserId = req.user?.id;
     if (!loggedInUserId) {
-      return res.status(401).json({
-        success: false,
-        message: 'Không tìm thấy thông tin người dùng đăng nhập'
-      });
+      return res.status(401).json({ success: false, message: 'Không tìm thấy thông tin người dùng đăng nhập' });
     }
 
+    const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
+    const userObjectId = new mongoose.Types.ObjectId(loggedInUserId); // FIX: dùng đúng ObjectId
 
-    // 1. Lấy danh sách user mà current user tương tác nhiều nhất
+    // 1. Lấy danh sách following
+    const currentUser = await User.findById(loggedInUserId).select('following').lean();
+    const followingIds = currentUser?.following?.map(id => id.toString()) || [];
+    const followingObjectIds = followingIds.map(id => new mongoose.Types.ObjectId(id));
+
+    // 2. Lấy tương tác mạnh nhất (FIX: dùng userObjectId đúng)
     const topInteractions = await Interaction.aggregate([
       {
         $match: {
-          user: new User({ _id: loggedInUserId })._id,
+          user: userObjectId,  // ← ĐÃ FIX
           type: { $in: ['like', 'comment', 'follow'] }
         }
       },
@@ -186,47 +293,35 @@ export const getRecommendedPosts = async (req, res) => {
           lastInteractionAt: { $max: '$lastInteractionAt' }
         }
       },
-      {
-        $sort: {
-          totalWeight: -1,
-          lastInteractionAt: -1
-        }
-      },
-      {
-        $limit: 20
-      }
+      { $sort: { totalWeight: -1, lastInteractionAt: -1 } },
+      { $limit: 30 }
     ]);
 
-    // Nếu chưa có dữ liệu tương tác, fallback dùng getPostHome logic hiện tại
+    // Nếu chưa có interaction → fallback về getPostHome
     if (!topInteractions || topInteractions.length === 0) {
       return getPostHome(req, res);
     }
 
-    const preferredAuthorIds = topInteractions.map((i) => i._id);
+    const interactedAuthorIds = topInteractions.map(i => i._id.toString());
+    const weightByAuthor = new Map(topInteractions.map(i => [i._id.toString(), i.totalWeight]));
 
-    // 1b. Lấy các chủ đề mà user hay tương tác (dựa trên like/comment bài viết có aiTopics)
+    // 3. Lấy các topic AI mà user hay tương tác
     const postInteractions = await Interaction.find({
       user: loggedInUserId,
       type: { $in: ['like', 'comment'] },
       targetPost: { $ne: null }
-    })
-      .select('targetPost weight')
-      .lean();
+    }).select('targetPost weight').lean();
 
-    const postIds = postInteractions.map((pi) => pi.targetPost);
+    const postIds = postInteractions.map(pi => pi.targetPost);
     const interactedPosts = postIds.length
-      ? await Post.find({ _id: { $in: postIds } })
-          .select('aiTopics')
-          .lean()
+      ? await Post.find({ _id: { $in: postIds } }).select('aiTopics').lean()
       : [];
 
-    const topicScoreMap = new Map(); // topic -> score
-    interactedPosts.forEach((p) => {
+    const topicScoreMap = new Map();
+    interactedPosts.forEach(p => {
       if (!Array.isArray(p.aiTopics)) return;
-      const weight =
-        postInteractions.find((pi) => String(pi.targetPost) === String(p._id))
-          ?.weight || 1;
-      p.aiTopics.forEach((t) => {
+      const weight = postInteractions.find(pi => String(pi.targetPost) === String(p._id))?.weight || 1;
+      p.aiTopics.forEach(t => {
         const key = String(t).toLowerCase();
         topicScoreMap.set(key, (topicScoreMap.get(key) || 0) + weight);
       });
@@ -237,165 +332,130 @@ export const getRecommendedPosts = async (req, res) => {
       .slice(0, 10)
       .map(([topic]) => topic);
 
-    // 2. Lấy bài viết của các user được ưu tiên
-    let posts = await Post.find({
-      author: { $in: preferredAuthorIds }
-    })
-      .populate('author', 'username profilePicture fullName checkMark')
-      .sort({ createdAt: -1 })
-      .lean();
+    // 4. Thu thập bài viết từ nhiều nguồn
+    const allAuthorIds = [...new Set([...interactedAuthorIds, ...followingIds])];
+    const allAuthorObjectIds = allAuthorIds.map(id => new mongoose.Types.ObjectId(id));
 
-    // Nếu số bài còn ít, bổ sung thêm bài hot từ các user khác (fallback nhẹ)
-    if (posts.length < limit) {
-      const extraPosts = await Post.find({
-        author: { $nin: preferredAuthorIds }
-      })
+    const [followingAndInteractedPosts, topicMatchedPosts, discoverPosts] = await Promise.all([
+      // Nguồn 1: bài từ người follow + người tương tác nhiều
+      Post.find({ author: { $in: allAuthorObjectIds } })
         .populate('author', 'username profilePicture fullName checkMark')
         .sort({ createdAt: -1 })
-        .limit(limit - posts.length)
-        .lean();
-      posts = [...posts, ...extraPosts];
+        .lean(),
+
+      // Nguồn 2: bài từ chủ đề AI phù hợp (người chưa follow)
+      preferredTopics.length > 0
+        ? Post.find({
+            aiTopics: { $in: preferredTopics },
+            author: { $nin: [...allAuthorObjectIds, userObjectId] }
+          })
+          .populate('author', 'username profilePicture fullName checkMark')
+          .sort({ createdAt: -1 })
+          .limit(limit * 2)
+          .lean()
+        : [],
+
+      // Nguồn 3: bài mới nhất từ người chưa quen (khám phá)
+      Post.find({ author: { $nin: [...allAuthorObjectIds, userObjectId] } })
+        .populate('author', 'username profilePicture fullName checkMark')
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean()
+    ]);
+
+    // 5. Gộp và loại trùng (FIX dedup)
+    const seenPostIds = new Set();
+    const uniquePosts = [];
+    for (const post of [...followingAndInteractedPosts, ...topicMatchedPosts, ...discoverPosts]) {
+      const id = post._id.toString();
+      if (!seenPostIds.has(id)) {
+        seenPostIds.add(id);
+        uniquePosts.push(post);
+      }
     }
 
+    // 6. Đảm bảo buff metrics cho khoatnn_6
+    await ensureBuffedMetrics(uniquePosts);
+
+    // 7. Đếm comment một lần (fix N+1)
     const now = new Date();
-    const usersWithStories = await Story.distinct('author', {
-      isArchived: false,
-      expiresAt: { $gt: now }
-    });
-    const usersWithStoriesSet = new Set(usersWithStories.map((id) => id.toString()));
+    const usersWithStories = await Story.distinct('author', { isArchived: false, expiresAt: { $gt: now } });
+    const usersWithStoriesSet = new Set(usersWithStories.map(id => id.toString()));
 
-    // 3. Tính toán thông tin bổ sung (likes/comments/isLike/engagement/hasStories)
-    const processedPosts = await Promise.all(
-      posts.map(async (post) => {
-        const likesArr = Array.isArray(post.likes)
-          ? post.likes.map((id) => id?.toString())
-          : [];
-        let isLike = false;
-        if (loggedInUserId && likesArr.length > 0) {
-          isLike = likesArr.includes(loggedInUserId.toString());
-        }
+    const uniquePostIds = uniquePosts.map(p => p._id);
+    const countMap = await getCommentCountsForPosts(uniquePostIds);
 
-        if (post.author.username === 'khoatnn_6') {
-          let buffedLikes = post.buffedLikes;
-          if (typeof buffedLikes !== 'number') {
-            buffedLikes = 200000 + Math.floor(Math.random() * 300000);
-            await Post.findByIdAndUpdate(post._id, { buffedLikes });
-          }
-          let buffedCommentCount = post.buffedCommentCount;
-          let buffedReplyCount = post.buffedReplyCount;
-          let updateObj = {};
-          if (typeof buffedCommentCount !== 'number') {
-            buffedCommentCount = Math.floor(Math.random() * 100000) + 200000;
-            updateObj.buffedCommentCount = buffedCommentCount;
-          }
-          if (typeof buffedReplyCount !== 'number') {
-            buffedReplyCount = Math.floor(Math.random() * 50000) + 100000;
-            updateObj.buffedReplyCount = buffedReplyCount;
-          }
-          if (Object.keys(updateObj).length > 0) {
-            await Post.findByIdAndUpdate(post._id, updateObj);
-          }
-          const totalLikes = (buffedLikes || 0) + likesArr.length;
-          const totalComments = (buffedCommentCount || 0) + (buffedReplyCount || 0);
-          return {
-            ...post,
-            likes: totalLikes,
-            realLikes: likesArr.length,
-            isBuffed: true,
-            buffedLikes: buffedLikes,
-            commentCount: buffedCommentCount,
-            replyCount: buffedReplyCount,
-            totalComments: totalComments,
-            totalLikes: totalLikes,
-            engagement: {
-              likes: totalLikes,
-              comments: totalComments,
-              total: totalLikes + totalComments
-            },
-            isLike: isLike,
-            hasStories: usersWithStoriesSet.has(post.author._id.toString())
-          };
-        }
-
-        const commentCount = await Comment.countDocuments({
-          post: post._id,
-          parentId: null
-        });
-        const replyCount = await Comment.countDocuments({
-          post: post._id,
-          parentId: { $ne: null }
-        });
-
-        const base = {
-          ...post,
-          commentCount,
-          replyCount,
-          totalComments: commentCount + replyCount,
-          likes: post.likes?.length || 0,
-          totalLikes: post.likes?.length || 0,
-          isBuffed: false,
-          engagement: {
-            likes: post.likes?.length || 0,
-            comments: commentCount + replyCount,
-            total: (post.likes?.length || 0) + commentCount + replyCount
-          },
-          isLike: isLike,
-          hasStories: usersWithStoriesSet.has(post.author._id.toString())
-        };
-        // Tính điểm ưu tiên theo chủ đề AI
-        const postTopics = Array.isArray(post.aiTopics)
-          ? post.aiTopics.map((t) => String(t).toLowerCase())
-          : [];
-        const matchedTopics = postTopics.filter((t) =>
-          preferredTopics.includes(t)
-        );
-        const topicScore = matchedTopics.length;
-        return {
-          ...base,
-          aiTopics: post.aiTopics || [],
-          aiTopicScore: topicScore,
-        };
-      })
+    // 8. Format posts
+    const processedPosts = uniquePosts.map(post =>
+      formatPost(post, loggedInUserId, countMap, usersWithStoriesSet)
     );
 
-    // 4. Xếp lại ưu tiên: các tác giả mình tương tác nhiều nằm trên trước
-    const weightByAuthor = new Map(
-      topInteractions.map((i) => [i._id.toString(), i.totalWeight])
-    );
+    // 9. Tính điểm Facebook-style: interaction weight + topic match + time decay
+    const scoredPosts = processedPosts.map(post => {
+      const authorId = post.author?._id?.toString();
 
-    processedPosts.sort((a, b) => {
-      const wa = weightByAuthor.get(a.author._id.toString()) || 0;
-      const wb = weightByAuthor.get(b.author._id.toString()) || 0;
-      const ta = a.aiTopicScore || 0;
-      const tb = b.aiTopicScore || 0;
+      // Điểm tương tác với tác giả
+      const interactionWeight = weightByAuthor.get(authorId) || 0;
 
-      // Ưu tiên vừa theo mức độ thân (wa) vừa theo trùng chủ đề (ta)
-      const scoreA = wa * 2 + ta;
-      const scoreB = wb * 2 + tb;
+      // Điểm following bonus
+      const followingBonus = followingIds.includes(authorId) ? 5 : 0;
 
-      if (scoreA !== scoreB) {
-        return scoreB - scoreA;
-      }
-      return new Date(b.createdAt) - new Date(a.createdAt);
+      // Điểm trùng chủ đề AI
+      const postTopics = Array.isArray(post.aiTopics)
+        ? post.aiTopics.map(t => String(t).toLowerCase())
+        : [];
+      const topicScore = postTopics.filter(t => preferredTopics.includes(t)).length;
+
+      // Điểm time decay (FIX: bài mới hơn ưu tiên hơn)
+      const recencyScore = getRecencyScore(post.createdAt) * 10;
+
+      // Điểm engagement (likes + comments)
+      const engagementScore = Math.log1p((post.totalLikes || 0) + (post.totalComments || 0)) * 0.5;
+
+      // Tổng điểm (giống Facebook scoring):
+      // interaction (quen biết) > following > topic (sở thích) > thời gian > engagement
+      const totalScore = interactionWeight * 3 + followingBonus * 2 + topicScore * 1.5 + recencyScore + engagementScore;
+
+      return { ...post, _score: totalScore };
     });
 
-    const slicedPosts = processedPosts.slice(0, limit);
+    // 10. Ưu tiên khoatnn_6 luôn ở đầu, sort phần còn lại theo score
+    const vanlocPosts = scoredPosts
+      .filter(p => p.author?.username === 'khoatnn_6')
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    const otherScoredPosts = scoredPosts
+      .filter(p => p.author?.username !== 'khoatnn_6')
+      .sort((a, b) => b._score - a._score);
+
+    const allSorted = [...vanlocPosts, ...otherScoredPosts];
+
+    // 11. Phân trang (FIX: thêm pagination cho getRecommendedPosts)
+    const totalPosts = allSorted.length;
+    const startIndex = (page - 1) * limit;
+    const paginatedPosts = allSorted.slice(startIndex, startIndex + limit);
+    const hasMore = startIndex + limit < totalPosts;
 
     return res.status(200).json({
       success: true,
-      posts: slicedPosts,
-      total: slicedPosts.length,
+      posts: paginatedPosts,
+      total: totalPosts,
+      page,
+      limit,
+      hasMore,
+      totalPages: Math.ceil(totalPosts / limit),
       isRecommendation: true
     });
   } catch (error) {
     console.error('Lỗi khi lấy bài viết gợi ý:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Lỗi máy chủ khi lấy bài viết gợi ý'
-    });
+    return res.status(500).json({ success: false, message: 'Lỗi máy chủ khi lấy bài viết gợi ý' });
   }
 };
 
+
+// ============================================================
+//  suggestUsers — Gợi ý người dùng (giữ nguyên)
+// ============================================================
 export const suggestUsers = async (req, res) => {
   try {
     const myId = req.user.id;
@@ -412,148 +472,101 @@ export const suggestUsers = async (req, res) => {
       .lean();
 
     users = users.map(u => {
-      // Buff cho khoatnn_6
       if (u.username === 'khoatnn_6') {
-        return {
-          ...u,
-          checkMark: true,
-          followersCount: 1000000,
-          isBuffed: true
-        };
+        return { ...u, checkMark: true, followersCount: 1000000, isBuffed: true };
       }
-      return {
-        ...u,
-        checkMark: !!u.checkMark,
-        followersCount: 0, // Không hiển thị số followers thật cho suggestion
-        isBuffed: false
-      };
+      return { ...u, checkMark: !!u.checkMark, followersCount: 0, isBuffed: false };
     });
 
     users.sort((a, b) => {
-      // khoatnn_6 luôn ở đầu
       if (a.username === 'khoatnn_6') return -1;
       if (b.username === 'khoatnn_6') return 1;
-
-      // Sau đó sắp xếp theo checkMark và username
       if (b.checkMark && !a.checkMark) return 1;
       if (!b.checkMark && a.checkMark) return -1;
-      if (a.username < b.username) return -1;
-      if (a.username > b.username) return 1;
-      return 0;
+      return a.username < b.username ? -1 : a.username > b.username ? 1 : 0;
     });
 
-    res.status(200).json({
-      success: true,
-      users,
-    });
+    return res.status(200).json({ success: true, users });
   } catch (error) {
     console.error('Lỗi khi gợi ý người dùng:', error);
-    res.status(500).json({ success: false, message: 'Lỗi máy chủ khi gợi ý người dùng' });
+    return res.status(500).json({ success: false, message: 'Lỗi máy chủ khi gợi ý người dùng' });
   }
 };
 
-// Lấy stories cho trang chủ - đã cập nhật để hỗ trợ audio
+
+// ============================================================
+//  getStoryHome — Lấy stories trang chủ (giữ nguyên)
+// ============================================================
 export const getStoryHome = async (req, res) => {
   try {
     const myId = req.user.id;
-    const { userId } = req.query; // Thêm tham số userId từ query
+    const { userId } = req.query;
 
-    // 1. Gọi hàm để archive các story hết hạn
     await archiveExpiredStories();
 
-    // 2. Tạo điều kiện query dựa trên userId
-    let userCondition = {};
     let storyCondition = {
       isArchived: false,
       expiresAt: { $gt: new Date() }
     };
 
-    // Lấy user khoatnn_6 để lấy _id
     const vanlocUser = await User.findOne({ username: 'khoatnn_6' }).lean();
     if (vanlocUser) {
-      // Nếu không filter userId, thì lấy story của khoatnn_6 bất kể expiresAt
       if (!userId) {
-        // Lấy tất cả story của khoatnn_6 (isArchived: false)
-        const vanlocStories = await Story.find({
-          author: vanlocUser._id,
-          isArchived: false
-        })
+        const vanlocStories = await Story.find({ author: vanlocUser._id, isArchived: false })
           .select('_id author')
           .populate('author', 'username profilePicture checkMark')
           .sort({ createdAt: -1 })
           .lean();
-        // Lấy các story còn hạn của user khác
+
         storyCondition.author = { $ne: vanlocUser._id };
         const stories = await Story.find(storyCondition)
           .select('_id author')
           .populate('author', 'username profilePicture checkMark')
           .sort({ createdAt: -1 })
           .lean();
-        // Ghép lại, story của khoatnn_6 luôn ở đầu
+
         const allStories = [...vanlocStories, ...stories];
-        // Tách story của chính mình ra đầu tiên
-        const myStories = allStories.filter(story => story.author._id.toString() === myId.toString());
-        const otherStories = allStories.filter(story => story.author._id.toString() !== myId.toString());
+        const myStories = allStories.filter(s => s.author._id.toString() === myId.toString());
+        const otherStories = allStories.filter(s => s.author._id.toString() !== myId.toString());
         const sortedStories = [...myStories, ...otherStories];
+
         return res.status(200).json({
           success: true,
-          stories: sortedStories.map(story => ({
-            _id: story._id,
-            author: story.author
-          })),
-          isSpecificUser: !!userId
+          stories: sortedStories.map(s => ({ _id: s._id, author: s.author })),
+          isSpecificUser: false
         });
-      } else if (userId && userId.toString() === vanlocUser._id.toString()) {
-        // Nếu lấy story của userId là khoatnn_6 thì cũng lấy tất cả story (isArchived: false)
-        const vanlocStories = await Story.find({
-          author: vanlocUser._id,
-          isArchived: false
-        })
+      } else if (userId.toString() === vanlocUser._id.toString()) {
+        const vanlocStories = await Story.find({ author: vanlocUser._id, isArchived: false })
           .select('_id author')
           .populate('author', 'username profilePicture checkMark')
           .sort({ createdAt: -1 })
           .lean();
+
         return res.status(200).json({
           success: true,
-          stories: vanlocStories.map(story => ({
-            _id: story._id,
-            author: story.author
-          })),
-          isSpecificUser: !!userId
+          stories: vanlocStories.map(s => ({ _id: s._id, author: s.author })),
+          isSpecificUser: true
         });
       }
     }
 
-    // 3. Lấy users theo điều kiện
-    const allUsers = await User.find(userCondition)
-      .select('username profilePicture checkMark')
-      .lean();
-
-    // 4. Lấy stories theo điều kiện
     const stories = await Story.find(storyCondition)
       .select('_id author')
       .populate('author', 'username profilePicture checkMark')
       .sort({ createdAt: -1 })
       .lean();
 
-    // Tách story của chính mình ra đầu tiên
-    const myStories = stories.filter(story => story.author._id.toString() === myId.toString());
-    const otherStories = stories.filter(story => story.author._id.toString() !== myId.toString());
+    const myStories = stories.filter(s => s.author._id.toString() === myId.toString());
+    const otherStories = stories.filter(s => s.author._id.toString() !== myId.toString());
     const sortedStories = [...myStories, ...otherStories];
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      stories: sortedStories.map(story => ({
-        _id: story._id,
-        author: story.author
-      })),
+      stories: sortedStories.map(s => ({ _id: s._id, author: s.author })),
       isSpecificUser: !!userId
     });
   } catch (error) {
     console.error('Lỗi khi lấy stories:', error);
-    res.status(500).json({ success: false, message: 'Lỗi server khi lấy stories' });
+    return res.status(500).json({ success: false, message: 'Lỗi server khi lấy stories' });
   }
 };
-
-
-
