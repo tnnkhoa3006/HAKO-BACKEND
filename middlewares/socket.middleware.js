@@ -12,7 +12,7 @@ export const initSocket = (server) => {
   const allowedOrigins = [
     'http://localhost:3000',
     'http://localhost:3001',
-    'https://hako-frontend.vercel.app',
+    'https://hakosocial.vercel.app',
     process.env.FRONTEND_URL,
   ].filter(Boolean);
 

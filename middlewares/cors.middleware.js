@@ -9,7 +9,7 @@ const corsMiddleware = () => {
         'http://localhost:3000',
         'http://localhost:3001',
         'https://randomuser.me/api/portraits',
-        'https://hako-frontend.vercel.app',
+        'https://hakosocial.vercel.app',
         process.env.FRONTEND_URL,
       ];
       if (!origin || allowedOrigins.includes(origin)) {
