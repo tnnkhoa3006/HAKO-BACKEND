@@ -66,7 +66,7 @@ export const getArchivedStories = async (req, res) => {
 // Tạo story mới - đã cập nhật để hỗ trợ audio
 export const createStory = async (req, res) => {
   try {
-    const { caption } = req.body;
+    const { caption, musicId } = req.body;
     const authorId = req.user.id;
 
     // Kiểm tra có file media không
@@ -90,12 +90,6 @@ export const createStory = async (req, res) => {
       isVanloc = true;
     }
 
-    // Xác định mediaType cuối cùng
-    let mediaType = baseMediaType;
-    if (audioFile) {
-      mediaType = `${baseMediaType}/audio`;
-    }
-
     // Upload media file
     let mediaResult;
     let videoDuration = null;
@@ -104,7 +98,7 @@ export const createStory = async (req, res) => {
     } else {
       mediaResult = await uploadVideo(mediaFile.path, 'stories');
       // Nếu là video thường (không có audio), lấy duration và kiểm tra max 1 phút
-      if (baseMediaType === 'video' && !audioFile) {
+      if (baseMediaType === 'video' && !audioFile && !musicId) {
         if (mediaResult.duration) {
           videoDuration = mediaResult.duration;
           if (videoDuration > 60) {
@@ -117,10 +111,25 @@ export const createStory = async (req, res) => {
       }
     }
 
-    // Upload audio file nếu có
+    // Xử lý audio: Ưu tiên file upload, sau đó đến musicId
     let audioResult = null;
     if (audioFile) {
       audioResult = await uploadAudio(audioFile.path, 'stories/audio');
+    } else if (musicId) {
+      const music = await StoryMusic.findById(musicId);
+      if (music) {
+        audioResult = {
+          secure_url: music.media,
+          public_id: music.mediaPublicId,
+          duration: music.duration
+        };
+      }
+    }
+
+    // Xác định mediaType cuối cùng
+    let mediaType = baseMediaType;
+    if (audioResult) {
+      mediaType = `${baseMediaType}/audio`;
     }
 
     // Tạo story mới
