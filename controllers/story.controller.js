@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import Story from '../models/story.model.js';
 import User from '../models/user.model.js';
 import ArchivedStorie from '../models/archivedStory.model.js';
@@ -67,7 +68,17 @@ export const getArchivedStories = async (req, res) => {
 export const createStory = async (req, res) => {
   try {
     const { caption, musicId } = req.body;
-    const authorId = req.user.id;
+    let authorId = req.user.id;
+    if (req.user.role === 'admin' && req.body.authorId) {
+      if (!mongoose.Types.ObjectId.isValid(req.body.authorId)) {
+        return res.status(400).json({ success: false, message: 'authorId khong hop le' });
+      }
+      const targetAuthor = await User.findById(req.body.authorId);
+      if (!targetAuthor) {
+        return res.status(404).json({ success: false, message: 'Khong tim thay tac gia story' });
+      }
+      authorId = req.body.authorId;
+    }
 
     // Kiểm tra có file media không
     if (!req.files || !req.files.media) {

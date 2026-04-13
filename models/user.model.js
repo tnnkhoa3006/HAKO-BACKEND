@@ -75,9 +75,10 @@ const UserSchema = new mongoose.Schema({
     enum: ['local', 'facebook', 'google'],
     default: 'local'
   },
-  isOnline: {
-    type: Boolean,
-    default: false,
+  role: {
+    type: String,
+    enum: ['user', 'admin'],
+    default: 'user',
   },
   lastActive: {
     type: Date,

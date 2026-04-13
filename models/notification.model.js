@@ -2,10 +2,11 @@ import mongoose from 'mongoose';
 
 const notificationSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, // Người nhận thông báo
-  type: { type: String, enum: ['like', 'follow', 'comment', 'reply'], required: true }, // Thêm 'reply' vào enum
+  type: { type: String, enum: ['like', 'follow', 'comment', 'reply', 'system'], required: true },
   fromUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, // Người thực hiện hành động
   post: { type: mongoose.Schema.Types.ObjectId, ref: 'Post' }, // Nếu là like/comment thì có post
   comment: { type: mongoose.Schema.Types.ObjectId, ref: 'Comment' }, // Nếu là comment thì có comment
+  message: { type: String, default: null },
   isRead: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });

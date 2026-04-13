@@ -81,6 +81,7 @@ export const login = async (req, res) => {
         posts: user.posts,
         isPrivate: user.isPrivate,
         authType: user.authType,
+        role: user.role || 'user',
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
         lastActive: user.lastActive
@@ -176,6 +177,7 @@ export const register = async (req, res) => {
         following: newUser.following,
         isPrivate: newUser.isPrivate,
         authType: newUser.authType,
+        role: newUser.role || 'user',
         createdAt: newUser.createdAt,
         updatedAt: newUser.updatedAt
       }
@@ -377,6 +379,7 @@ export const googleAuth = async (req, res) => {
         posts: user.posts,
         isPrivate: user.isPrivate,
         authType: user.authType,
+        role: user.role || 'user',
         createdAt: user.createdAt,
         updatedAt: user.updatedAt
       }

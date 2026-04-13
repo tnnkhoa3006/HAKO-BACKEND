@@ -1,4 +1,5 @@
 // controllers/post.controllers.js
+import mongoose from 'mongoose';
 import Post from '../models/post.model.js';
 import { uploadImage, uploadVideo } from '../utils/cloudinaryUpload.js';
 import User from '../models/user.model.js';
@@ -24,7 +25,17 @@ import { createNotification, removeLikeNotification } from '../server/notificati
 export const createPost = async (req, res) => {
   try {
     const { caption, desc, type } = req.body;
-    const authorId = req.user.id;
+    let authorId = req.user.id;
+    if (req.user.role === 'admin' && req.body.authorId) {
+      if (!mongoose.Types.ObjectId.isValid(req.body.authorId)) {
+        return res.status(400).json({ success: false, message: 'authorId khong hop le' });
+      }
+      const targetAuthor = await User.findById(req.body.authorId);
+      if (!targetAuthor) {
+        return res.status(404).json({ success: false, message: 'Khong tim thay tac gia bai viet' });
+      }
+      authorId = req.body.authorId;
+    }
 
     // VALIDATION: Kiểm tra user có tồn tại không
     const currentUser = await User.findById(authorId);
@@ -57,14 +68,13 @@ export const createPost = async (req, res) => {
       result = await uploadVideo(req.file.path, 'reels');
     }
 
-    // SECURITY: Chỉ sử dụng authorId từ token, không cho phép override
     const newPost = new Post({
       caption,
       desc,
       fileUrl: result.secure_url,
       filePublicId: result.public_id,
       type,
-      author: authorId, // Luôn luôn là user đang đăng nhập
+      author: authorId,
     });
 
     await newPost.save();
@@ -120,21 +130,22 @@ export const deletePostById = async (req, res) => {
         .json({ success: false, message: 'Không tìm thấy bài viết' });
     }
 
-    // SECURITY: Chỉ cho phép tác giả thật sự xóa bài viết của chính mình
-    if (post.author._id.toString() !== currentUserId) {
+    const isAdmin = req.user.role === 'admin';
+    const authorMongoId = post.author._id.toString();
+
+    if (!isAdmin && authorMongoId !== currentUserId) {
       return res
         .status(403)
         .json({
           success: false,
-          message: 'Bạn chỉ có thể xóa bài viết của chính mình',
+          message: 'Ban chi co the xoa bai viet cua chinh minh',
         });
     }
 
-    // DOUBLE CHECK: Đảm bảo user hiện tại và author của post là cùng 1 người
-    if (currentUser._id.toString() !== post.author._id.toString()) {
+    if (!isAdmin && currentUser._id.toString() !== authorMongoId) {
       return res.status(403).json({
         success: false,
-        message: 'Không có quyền xóa bài viết này'
+        message: 'Khong co quyen xoa bai viet nay'
       });
     }
 
@@ -151,8 +162,7 @@ export const deletePostById = async (req, res) => {
     // Xóa post khỏi DB
     await post.deleteOne();
 
-    // Cập nhật lại danh sách post trong user (chỉ xóa khỏi user thật sự sở hữu)
-    await User.findByIdAndUpdate(currentUserId, { $pull: { posts: postId } });
+    await User.findByIdAndUpdate(post.author._id, { $pull: { posts: postId } });
 
     res.status(200).json({ success: true, message: 'Xóa bài viết thành công' });
   } catch (error) {
