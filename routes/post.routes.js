@@ -6,7 +6,8 @@ import {
   deletePostById,
   addComment,
   getCommentsForItem,
-  likePost
+  likePost,
+  getRelatedPosts
 } from '../controllers/post.controller.js';
 import { verifyToken } from '../middlewares/auth.middleware.js';
 import upload from '../helper/cloudinary.js';
@@ -17,6 +18,7 @@ router.post('/create', verifyToken, upload.single('file'), createPost);
 router.get('/getPostUser/:userId', verifyToken, getPostUser);
 router.delete('/delete/:postId', verifyToken, deletePostById);
 router.get('/:postId', verifyToken, getPostById);
+router.get('/:postId/related', verifyToken, getRelatedPosts);
 router.post('/like/:postId', verifyToken, likePost);
 
 // --- Routes for Comments ---

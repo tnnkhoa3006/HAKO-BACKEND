@@ -1010,3 +1010,52 @@ const sortRepliesRecursively = (replies) => {
 };
 
 
+
+// Lấy các bài viết liên quan dựa trên AI Topics
+export const getRelatedPosts = async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const limit = parseInt(req.query.limit) || 5;
+
+    // 1. Lấy bài viết gốc để xem topics
+    const currentPost = await Post.findById(postId);
+    if (!currentPost) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy bài viết' });
+    }
+
+    const topics = currentPost.aiTopics || [];
+    if (topics.length === 0) {
+      return res.status(200).json({ success: true, posts: [] });
+    }
+
+    // 2. Tìm các bài viết có chung ít nhất 1 topic
+    // Loại trừ bài viết hiện tại
+    const relatedPosts = await Post.find({
+      _id: { $ne: postId },
+      aiTopics: { $in: topics }
+    })
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .populate('author', 'username profilePicture fullname checkMark')
+    .lean();
+
+    // 3. Xử lý logic buffed likes nếu cần (giống getPostUser/getPostById)
+    const processedPosts = relatedPosts.map(post => {
+      const likesArr = (post.likes || []).map(id => id.toString());
+      if (post.author.username === 'khoatnn_6') {
+        const totalLikes = (post.buffedLikes || 0) + likesArr.length;
+        return { ...post, likes: totalLikes, isBuffed: true };
+      }
+      return { ...post, likes: likesArr.length, isBuffed: false };
+    });
+
+    res.status(200).json({
+      success: true,
+      posts: processedPosts
+    });
+
+  } catch (error) {
+    console.error('Lỗi khi lấy bài viết liên quan:', error);
+    res.status(500).json({ success: false, message: 'Lỗi máy chủ' });
+  }
+};
