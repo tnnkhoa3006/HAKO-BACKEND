@@ -8,6 +8,7 @@ import storyRoutes from './story.routes.js';
 import iceTokenRoute from './ice-token.routes.js';
 import adminRoute from './admin.routes.js';
 import notificationRoute from './notification.routes.js';
+import groupRoutes from './group.routes.js';
 
 const router = express.Router();
 
@@ -20,6 +21,7 @@ router.use('/api/story', storyRoutes);
 router.use('/api/ice-token', iceTokenRoute);
 router.use('/api/notification', notificationRoute);
 router.use('/api/admin', adminRoute);
+router.use('/api/groups', groupRoutes);
 
 
 export default router;

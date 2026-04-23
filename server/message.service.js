@@ -12,6 +12,12 @@ export const handleMessages = (socket, io, onlineUsers) => {
     socket.join(userId.toString());
   });
 
+  // Đăng ký socket join phòng group
+  socket.on('joinGroupRoom', (groupId) => {
+    if (!groupId) return;
+    socket.join(`group_${groupId}`);
+  });
+
   socket.on('sendMessage', async (data) => {
     /**
      * data = {
@@ -44,14 +50,21 @@ export const handleMessages = (socket, io, onlineUsers) => {
       }
 
       // Lưu tin nhắn vào DB, thêm replyTo nếu có
-      const newMessage = await Message.create({
+      const messageData = {
         senderId: data.senderId,
-        receiverId: data.receiverId,
         message: data.message,
         replyTo: data.replyTo || null,
         mediaUrl,
         mediaType
-      });
+      };
+
+      if (data.groupId) {
+        messageData.groupId = data.groupId;
+      } else {
+        messageData.receiverId = data.receiverId;
+      }
+
+      const newMessage = await Message.create(messageData);
 
       // Lấy thông tin người gửi để gửi về client
       const author = await User.findById(data.senderId)
@@ -79,15 +92,21 @@ export const handleMessages = (socket, io, onlineUsers) => {
           message: replyToMessage.message,
           senderId: replyToMessage.senderId,
           receiverId: replyToMessage.receiverId,
+          groupId: replyToMessage.groupId,
           createdAt: replyToMessage.createdAt
         } : null,
         mediaUrl,
         mediaType,
+        groupId: newMessage.groupId,
         tempId: data.tempId || undefined // Thêm tempId để FE thay thế message tạm
       };
 
       // Gửi tin nhắn cho người nhận thông qua phòng
-      socket.to(data.receiverId.toString()).emit('receiveMessage', response);
+      if (data.groupId) {
+        socket.to(`group_${data.groupId}`).emit('receiveMessage', response);
+      } else if (data.receiverId) {
+        socket.to(data.receiverId.toString()).emit('receiveMessage', response);
+      }
 
       // Gửi lại cho người gửi để xác nhận
       socket.emit('receiveMessage', response);
@@ -99,55 +118,57 @@ export const handleMessages = (socket, io, onlineUsers) => {
         status: 'sent'
       });
 
-      // Tạo đối tượng cập nhật recent chat cho người gửi
-      const senderRecentChat = {
-        user: {
-          _id: author._id,
-          username: author.username,
-          profilePicture: author.profilePicture,
-          checkMark: !!author.checkMark,
-          isOnline: onlineUsers.has(author._id.toString()),
-          lastActive: author.lastActive,
-          lastOnline: author.lastOnline
-        },
-        lastMessage: {
-          _id: newMessage._id,
-          message: newMessage.message,
-          isOwnMessage: true,
-          createdAt: newMessage.createdAt,
-          isRead: newMessage.isRead
-        }
-      };
+      // Emit cập nhật recent chat cho người gửi (chỉ cho chat cá nhân)
+      if (!data.groupId) {
+        const senderRecentChat = {
+          user: {
+            _id: author._id,
+            username: author.username,
+            profilePicture: author.profilePicture,
+            checkMark: !!author.checkMark,
+            isOnline: onlineUsers.has(author._id.toString()),
+            lastActive: author.lastActive,
+            lastOnline: author.lastOnline
+          },
+          lastMessage: {
+            _id: newMessage._id,
+            message: newMessage.message,
+            isOwnMessage: true,
+            createdAt: newMessage.createdAt,
+            isRead: newMessage.isRead
+          }
+        };
+        socket.emit('updateRecentChat', senderRecentChat);
+      }
 
-      // Emit cập nhật recent chat cho người gửi
-      socket.emit('updateRecentChat', senderRecentChat);
+      // Lấy thông tin người nhận nếu là chat 1-1
+      if (!data.groupId && data.receiverId) {
+        const receiver = await User.findById(data.receiverId)
+          .select('username profilePicture checkMark lastActive lastOnline');
 
-      // Lấy thông tin người nhận
-      const receiver = await User.findById(data.receiverId)
-        .select('username profilePicture checkMark lastActive lastOnline');
+        // Tạo đối tượng cập nhật recent chat cho người nhận
+        const receiverRecentChat = {
+          user: {
+            _id: receiver._id,
+            username: receiver.username,
+            profilePicture: receiver.profilePicture,
+            checkMark: !!receiver.checkMark,
+            isOnline: onlineUsers.has(receiver._id.toString()),
+            lastActive: receiver.lastActive,
+            lastOnline: receiver.lastOnline
+          },
+          lastMessage: {
+            _id: newMessage._id,
+            message: newMessage.message,
+            isOwnMessage: false,
+            createdAt: newMessage.createdAt,
+            isRead: newMessage.isRead
+          }
+        };
 
-      // Tạo đối tượng cập nhật recent chat cho người nhận
-      const receiverRecentChat = {
-        user: {
-          _id: receiver._id,
-          username: receiver.username,
-          profilePicture: receiver.profilePicture,
-          checkMark: !!receiver.checkMark,
-          isOnline: onlineUsers.has(receiver._id.toString()),
-          lastActive: receiver.lastActive,
-          lastOnline: receiver.lastOnline
-        },
-        lastMessage: {
-          _id: newMessage._id,
-          message: newMessage.message,
-          isOwnMessage: false,
-          createdAt: newMessage.createdAt,
-          isRead: newMessage.isRead
-        }
-      };
-
-      // Emit cập nhật recent chat cho người nhận
-      socket.to(data.receiverId.toString()).emit('updateRecentChat', receiverRecentChat);
+        // Emit cập nhật recent chat cho người nhận
+        socket.to(data.receiverId.toString()).emit('updateRecentChat', receiverRecentChat);
+      }
 
     } catch (error) {
       console.error('Lỗi khi gửi tin nhắn qua socket:', error);

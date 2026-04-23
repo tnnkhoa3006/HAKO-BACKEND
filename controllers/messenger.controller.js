@@ -7,7 +7,7 @@ import { v2 as cloudinary } from 'cloudinary';
 // Gửi tin nhắn (hỗ trợ gửi media)
 export const sendMessage = async (req, res) => {
   try {
-    const { receiverId, message, replyTo } = req.body;
+    const { receiverId, groupId, message, replyTo } = req.body;
     const senderId = req.user._id;
     let mediaUrl = null;
     let mediaType = null;
@@ -54,6 +54,7 @@ export const sendMessage = async (req, res) => {
     const newMessage = new Message({
       senderId,
       receiverId,
+      groupId,
       message,
       replyTo: parentMessage ? parentMessage._id : undefined,
       mediaUrl,
@@ -85,17 +86,18 @@ export const sendMessage = async (req, res) => {
   }
 };
 
-// lấy tin nhắn giữa 2 người dùng
+// lấy tin nhắn giữa 2 người dùng hoặc 1 nhóm
 export const getMessages = async (req, res) => {
   try {
     const userId1 = req.user._id.toString();
-    const userId2 = req.params.userId;
+    const targetId = req.params.userId; // Có thể là userId hoặc groupId
+    const isGroup = req.query.isGroup === 'true';
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
     const loadAll = req.query.loadAll === 'true';
 
-    if (!userId2) {
-      return res.status(400).json({ message: 'userId là bắt buộc' });
+    if (!targetId) {
+      return res.status(400).json({ message: 'targetId là bắt buộc' });
     }
 
     let messages;
@@ -114,13 +116,20 @@ export const getMessages = async (req, res) => {
       }
     ];
 
-    if (loadAll) {
-      messages = await Message.find({
+    let query = {};
+    if (isGroup) {
+      query = { groupId: targetId };
+    } else {
+      query = {
         $or: [
-          { senderId: userId1, receiverId: userId2 },
-          { senderId: userId2, receiverId: userId1 },
+          { senderId: userId1, receiverId: targetId },
+          { senderId: targetId, receiverId: userId1 },
         ],
-      })
+      };
+    }
+
+    if (loadAll) {
+      messages = await Message.find(query)
         .populate(populateOptions)
         .sort({ createdAt: 1 })
         .lean();
@@ -129,19 +138,9 @@ export const getMessages = async (req, res) => {
     } else {
       const skip = (page - 1) * limit;
 
-      totalMessages = await Message.countDocuments({
-        $or: [
-          { senderId: userId1, receiverId: userId2 },
-          { senderId: userId2, receiverId: userId1 },
-        ],
-      });
+      totalMessages = await Message.countDocuments(query);
 
-      messages = await Message.find({
-        $or: [
-          { senderId: userId1, receiverId: userId2 },
-          { senderId: userId2, receiverId: userId1 },
-        ],
-      })
+      messages = await Message.find(query)
         .populate(populateOptions)
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -155,8 +154,9 @@ export const getMessages = async (req, res) => {
     // Đánh dấu tin nhắn từ người khác là đã đọc
     const unreadMessageIds = messages
       .filter(msg =>
-        msg.senderId._id.toString() === userId2 &&
-        msg.receiverId._id.toString() === userId1 &&
+        msg.senderId._id.toString() !== userId1 &&
+        !isGroup && // Bỏ qua mark as read cho group hiện tại để đơn giản
+        msg.receiverId?._id?.toString() === userId1 &&
         !msg.isRead
       )
       .map(msg => msg._id);
@@ -169,7 +169,7 @@ export const getMessages = async (req, res) => {
 
       const io = getIO();
       if (io) {
-        io.to(userId2).emit('messagesRead', {
+        io.to(targetId).emit('messagesRead', {
           messageIds: unreadMessageIds,
           readBy: userId1
         });
@@ -231,20 +231,26 @@ export const getMessages = async (req, res) => {
 export const getMessagesWithPagination = async (req, res) => {
   try {
     const userId1 = req.user._id.toString();
-    const userId2 = req.params.userId;
+    const targetId = req.params.userId;
+    const isGroup = req.query.isGroup === 'true';
     const before = req.query.before; // timestamp để load tin nhắn trước đó
     const limit = parseInt(req.query.limit) || 20;
 
-    if (!userId2) {
-      return res.status(400).json({ message: 'userId là bắt buộc' });
+    if (!targetId) {
+      return res.status(400).json({ message: 'targetId là bắt buộc' });
     }
 
-    let query = {
-      $or: [
-        { senderId: userId1, receiverId: userId2 },
-        { senderId: userId2, receiverId: userId1 },
-      ],
-    };
+    let query = {};
+    if (isGroup) {
+      query = { groupId: targetId };
+    } else {
+      query = {
+        $or: [
+          { senderId: userId1, receiverId: targetId },
+          { senderId: targetId, receiverId: userId1 },
+        ],
+      };
+    }
 
     // Nếu có before timestamp, chỉ lấy tin nhắn trước thời điểm đó
     if (before) {
@@ -430,7 +436,8 @@ export const getRecentChats = async (req, res) => {
           $or: [
             { senderId: userId },
             { receiverId: userId }
-          ]
+          ],
+          groupId: null // Chỉ lấy tin nhắn cá nhân
         }
       },
       {
