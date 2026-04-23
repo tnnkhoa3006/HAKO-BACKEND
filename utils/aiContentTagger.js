@@ -29,9 +29,16 @@ export const analyzePostContent = async ({ caption, desc }) => {
           parts: [
             {
               text:
-                'Phân tích nội dung bài post sau và trả về JSON với dạng {"topics": string[], "summary": string}. ' +
-                'Chỉ in đúng JSON, không thêm giải thích nào khác.\n\n' +
-                text,
+                `Phân tích nội dung bài viết sau để trích xuất ra tối đa 5 chủ đề (topics) và 1 bản tóm tắt ngắn (summary).
+                Yêu cầu cho topics:
+                - Phải là các danh từ chung, khái quát và mang tính phân loại cao (Ví dụ: nếu bài viết về quần, áo, giày -> chủ đề là 'Thời trang'; nếu về món ăn, công thức -> 'Ẩm thực'; nếu về điện thoại, máy tính -> 'Công nghệ').
+                - Sử dụng tiếng Việt, viết hoa chữ cái đầu.
+                - Mục tiêu là để dễ dàng tìm kiếm các bài viết liên quan có cùng chủ đề rộng.
+                
+                Trả về JSON duy nhất với định dạng: {"topics": string[], "summary": string}. Không thêm giải thích nào khác.
+                
+                Nội dung bài viết:
+                ${text}`,
             },
           ],
         },
