@@ -5,6 +5,7 @@ import { uploadImage, uploadVideo } from '../utils/cloudinaryUpload.js';
 import User from '../models/user.model.js';
 import Comment from '../models/comment.model.js';
 import Interaction from '../models/interaction.model.js';
+import Story from '../models/story.model.js';
 import { analyzePostContent } from '../utils/aiContentTagger.js';
 import {
   createCommentForPost,
@@ -25,6 +26,9 @@ import { createNotification, removeLikeNotification } from '../server/notificati
 export const createPost = async (req, res) => {
   try {
     const { caption, desc, type } = req.body;
+    const trimmedCaption = typeof caption === 'string' ? caption.trim() : '';
+    const trimmedDesc = typeof desc === 'string' ? desc.trim() : '';
+    const requestedType = typeof type === 'string' ? type.trim() : '';
     let authorId = req.user.id;
     if (req.user.role === 'admin' && req.body.authorId) {
       if (!mongoose.Types.ObjectId.isValid(req.body.authorId)) {
@@ -46,13 +50,26 @@ export const createPost = async (req, res) => {
       });
     }
 
-    if (!req.file) {
+    if (!req.file && !trimmedCaption && !trimmedDesc) {
       return res
         .status(400)
         .json({ success: false, message: 'Không có file nào được tải lên' });
     }
 
-    if (!['image', 'video'].includes(type)) {
+    const normalizedType = req.file
+      ? requestedType
+      : (requestedType === 'text' || (!requestedType && (trimmedCaption || trimmedDesc))) ? 'text' : requestedType;
+
+    if (!req.file && normalizedType !== 'text') {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: 'BÃ i chá»‰ cÃ³ caption pháº£i cÃ³ type lÃ  text',
+        });
+    }
+
+    if (req.file && !['image', 'video'].includes(normalizedType)) {
       return res
         .status(400)
         .json({
@@ -62,18 +79,18 @@ export const createPost = async (req, res) => {
     }
 
     let result;
-    if (type === 'image') {
+    if (normalizedType === 'image') {
       result = await uploadImage(req.file.path, 'posts');
-    } else if (type === 'video') {
+    } else if (normalizedType === 'video') {
       result = await uploadVideo(req.file.path, 'reels');
     }
 
     const newPost = new Post({
-      caption,
-      desc,
-      fileUrl: result.secure_url,
-      filePublicId: result.public_id,
-      type,
+      caption: trimmedCaption,
+      desc: trimmedDesc,
+      fileUrl: result?.secure_url || '',
+      filePublicId: result?.public_id || '',
+      type: normalizedType,
       author: authorId,
     });
 
@@ -81,7 +98,10 @@ export const createPost = async (req, res) => {
 
     // Phân tích nội dung bài viết bằng AI để gắn chủ đề/tóm tắt (không chặn luồng nếu lỗi)
     try {
-      const { topics, summary } = await analyzePostContent({ caption, desc });
+      const { topics, summary } = await analyzePostContent({
+        caption: trimmedCaption,
+        desc: trimmedDesc,
+      });
       if ((topics && topics.length > 0) || summary) {
         newPost.aiTopics = topics || [];
         newPost.aiSummary = summary || undefined;
@@ -92,14 +112,31 @@ export const createPost = async (req, res) => {
     }
 
     // Chỉ thêm vào mảng posts của chính user đó nếu là ảnh
-    if (type === 'image') {
+    if (['image', 'video'].includes(normalizedType)) {
       await User.findByIdAndUpdate(authorId, { $push: { posts: newPost._id } });
     }
+
+    await newPost.populate('author', 'username profilePicture fullName checkMark');
+    const hasStories = await Story.exists({
+      author: authorId,
+      isArchived: false,
+      expiresAt: { $gt: new Date() },
+    });
 
     res.status(201).json({
       success: true,
       message: 'Đăng bài viết thành công',
-      post: newPost,
+      post: {
+        ...newPost.toObject(),
+        likes: 0,
+        comments: [],
+        totalLikes: 0,
+        totalComments: 0,
+        isLike: false,
+        isLiked: false,
+        isBookmarked: false,
+        hasStories: !!hasStories,
+      },
     });
   } catch (error) {
     console.error('Lỗi khi tạo bài viết:', error);
@@ -281,7 +318,7 @@ export const getPostUser = async (req, res) => {
       });
     }
 
-    let filter = { author: user._id };
+    let filter = { author: user._id, type: { $in: ['image', 'video'] } };
     if (type === 'image') {
       filter.type = 'image';
     } else if (type === 'video') {
@@ -497,7 +534,7 @@ export const addComment = async (req, res) => {
       });
     }
 
-    const mappedType = (itemType === 'post' || itemType === 'image') ? 'post' :
+    const mappedType = (itemType === 'post' || itemType === 'image' || itemType === 'text') ? 'post' :
       itemType === 'reel' ? 'reels' :
         itemType === 'video' ? 'video' : 'post';
 
@@ -594,7 +631,7 @@ export const addComment = async (req, res) => {
       }
     }
     // Tạo notification cho chủ post khi có comment mới (không phải comment của chính mình)
-    if (!parentId && itemType === 'post') {
+    if (!parentId && ['post', 'image', 'text'].includes(itemType)) {
       const post = await Post.findById(itemId).populate('author', '_id');
       if (post && post.author && post.author._id.toString() !== authorId) {
         await createNotification({
@@ -607,7 +644,7 @@ export const addComment = async (req, res) => {
       }
     }
     // Tạo notification cho chủ comment khi có reply (không phải reply của chính mình)
-    if (parentId && itemType === 'post') {
+    if (parentId && ['post', 'image', 'text'].includes(itemType)) {
       const parentComment = await Comment.findById(parentId).populate('author', '_id');
       if (parentComment && parentComment.author && parentComment.author._id.toString() !== authorId) {
         await createNotification({
@@ -656,7 +693,7 @@ export const getCommentsForItem = async (req, res) => {
       });
     }
 
-    const mappedType = itemType === 'post' ? 'post' :
+    const mappedType = (itemType === 'post' || itemType === 'image' || itemType === 'text') ? 'post' :
       itemType === 'reel' ? 'reels' :
         itemType === 'video' ? 'video' : 'post';
 

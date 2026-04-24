@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_MODEL = 'gemini-3-flash-preview';
 
 /**
  * Phân tích nội dung bài post bằng Gemini để gắn nhãn chủ đề và tóm tắt ngắn.

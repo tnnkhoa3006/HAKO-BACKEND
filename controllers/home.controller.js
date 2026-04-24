@@ -165,8 +165,11 @@ export const getPostHome = async (req, res) => {
 
     // 2. Lấy bài của user đang theo dõi (ưu tiên 1)
     const followingObjectIds = followingIds.map(id => new mongoose.Types.ObjectId(id));
+    const prioritizedAuthorIds = loggedInUserId
+      ? [...followingObjectIds, new mongoose.Types.ObjectId(loggedInUserId)]
+      : followingObjectIds;
     const followingPosts = await Post.find(
-      followingIds.length > 0 ? { author: { $in: followingObjectIds } } : {}
+      prioritizedAuthorIds.length > 0 ? { author: { $in: prioritizedAuthorIds } } : {}
     )
       .populate('author', 'username profilePicture fullName checkMark')
       .sort({ createdAt: -1 })
@@ -333,7 +336,7 @@ export const getRecommendedPosts = async (req, res) => {
       .map(([topic]) => topic);
 
     // 4. Thu thập bài viết từ nhiều nguồn
-    const allAuthorIds = [...new Set([...interactedAuthorIds, ...followingIds])];
+    const allAuthorIds = [...new Set([...interactedAuthorIds, ...followingIds, loggedInUserId])];
     const allAuthorObjectIds = allAuthorIds.map(id => new mongoose.Types.ObjectId(id));
 
     const [followingAndInteractedPosts, topicMatchedPosts, discoverPosts] = await Promise.all([

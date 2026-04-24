@@ -12,15 +12,15 @@ const postSchema = new mongoose.Schema({
   },
   fileUrl: {
     type: String, // URL từ Cloudinary
-    required: true,
+    default: "",
   },
   filePublicId: {
     type: String, // ID để xoá file khỏi Cloudinary
-    required: true,
+    default: "",
   },
   type: {
     type: String,
-    enum: ['image', 'video'],
+    enum: ["image", "video", "text"],
     required: true,
   },
   author: {
