@@ -3,16 +3,91 @@ import User from '../models/user.model.js';
 import { getIO } from '../middlewares/socket.middleware.js';
 import { uploadImage, uploadVideo } from '../utils/cloudinaryUpload.js';
 import { v2 as cloudinary } from 'cloudinary';
+import {
+  BOT_USER_SELECT_FIELDS,
+  createBotReplyMessage,
+  isHakoBotReceiver,
+} from '../services/bot.service.js';
 
-// Gửi tin nhắn (hỗ trợ gửi media)
+const getIdString = (value) => {
+  if (!value) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object' && value._id) return value._id.toString();
+  return value.toString();
+};
+
+const buildConversationQuery = ({ userId, targetId, isGroup }) => {
+  if (isGroup) {
+    return { groupId: targetId };
+  }
+
+  return {
+    $or: [
+      { senderId: userId, receiverId: targetId },
+      { senderId: targetId, receiverId: userId },
+    ],
+  };
+};
+
+const populateOptions = [
+  { path: 'senderId', select: BOT_USER_SELECT_FIELDS },
+  { path: 'receiverId', select: BOT_USER_SELECT_FIELDS },
+  {
+    path: 'replyTo',
+    populate: {
+      path: 'senderId',
+      select: 'username fullName profilePicture checkMark isBot',
+    },
+  },
+];
+
+const buildReplyType = (message) => {
+  if (!message?.replyTo || typeof message.replyTo !== 'object' || !message.replyTo.senderId) {
+    return { replyType: null, replyTo: message?.replyTo || null };
+  }
+
+  const replySenderId = getIdString(message.replyTo.senderId);
+  const senderId = getIdString(message.senderId);
+  const replyType = replySenderId && replySenderId === senderId ? 'self' : 'other';
+
+  return {
+    replyType,
+    replyTo: {
+      ...message.replyTo,
+      replyType,
+    },
+  };
+};
+
+const toMessageResponse = (message, currentUserId, unreadMessageIds = []) => {
+  const { replyType, replyTo } = buildReplyType(message);
+  const messageId = getIdString(message._id);
+
+  return {
+    _id: message._id,
+    senderId: message.senderId,
+    receiverId: message.receiverId,
+    message: message.message,
+    mediaUrl: message.mediaUrl,
+    mediaType: message.mediaType,
+    botPayload: message.botPayload || null,
+    replyTo,
+    isRead: unreadMessageIds.includes(messageId) ? true : message.isRead,
+    createdAt: message.createdAt,
+    updatedAt: message.updatedAt,
+    isOwnMessage: getIdString(message.senderId) === currentUserId,
+    replyType,
+  };
+};
+
 export const sendMessage = async (req, res) => {
   try {
     const { receiverId, groupId, message, replyTo } = req.body;
     const senderId = req.user._id;
+    const trimmedMessage = typeof message === 'string' ? message.trim() : '';
     let mediaUrl = null;
     let mediaType = null;
 
-    // Xử lý file upload nếu có
     if (req.file) {
       if (req.file.mimetype.startsWith('image/')) {
         const result = await uploadImage(req.file.path, 'messenger/images');
@@ -25,11 +100,12 @@ export const sendMessage = async (req, res) => {
       }
     }
 
-    if (!receiverId || (!message && !mediaUrl)) {
-      return res.status(400).json({ message: 'receiverId và message hoặc media là bắt buộc' });
+    if (!receiverId || (!trimmedMessage && !mediaUrl)) {
+      return res
+        .status(400)
+        .json({ message: 'receiverId va message hoac media la bat buoc' });
     }
 
-    // Kiểm tra tin nhắn được reply có tồn tại không (nếu có replyTo)
     let parentMessage = null;
     if (replyTo) {
       parentMessage = await Message.findById(replyTo)
@@ -37,109 +113,86 @@ export const sendMessage = async (req, res) => {
         .populate('receiverId', 'username fullName');
 
       if (!parentMessage) {
-        return res.status(400).json({ message: 'Tin nhắn được reply không tồn tại' });
+        return res
+          .status(400)
+          .json({ message: 'Tin nhan duoc reply khong ton tai' });
       }
     }
 
-    // Xác định rõ ràng replyTo là trả lời tin nhắn của chính mình hay của người khác
     let replyType = null;
     if (parentMessage) {
-      if (parentMessage.senderId.toString() === senderId.toString()) {
-        replyType = "self"; // Trả lời tin nhắn của chính mình
-      } else {
-        replyType = "other"; // Trả lời tin nhắn của người khác
-      }
+      replyType =
+        getIdString(parentMessage.senderId) === senderId.toString() ? 'self' : 'other';
     }
 
-    const newMessage = new Message({
+    const savedMessage = await Message.create({
       senderId,
       receiverId,
       groupId,
-      message,
+      message: trimmedMessage,
       replyTo: parentMessage ? parentMessage._id : undefined,
       mediaUrl,
       mediaType,
-      replyType // Thêm trường này để FE biết rõ loại reply
     });
 
-    const savedMessage = await newMessage.save();
-
-    // Populate để lấy thông tin đầy đủ
     const populatedMessage = await Message.findById(savedMessage._id)
-      .populate('senderId', 'username fullName checkMark')
-      .populate('receiverId', 'username fullName')
-      .populate({
-        path: 'replyTo',
-        populate: {
-          path: 'senderId',
-          select: 'username fullName'
-        }
+      .populate(populateOptions)
+      .lean();
+
+    if (await isHakoBotReceiver(receiverId)) {
+      const { botMessage } = await createBotReplyMessage({
+        userId: senderId,
+        messageText: trimmedMessage,
       });
 
-    // Đưa replyType vào response
+      return res.status(201).json({
+        message: {
+          ...toMessageResponse(populatedMessage, senderId.toString()),
+          replyType,
+        },
+        botReply: toMessageResponse(botMessage, senderId.toString()),
+      });
+    }
+
     return res.status(201).json({
-      message: { ...populatedMessage.toObject(), replyType }
+      message: {
+        ...toMessageResponse(populatedMessage, senderId.toString()),
+        replyType,
+      },
     });
   } catch (error) {
-    console.error('Lỗi gửi tin nhắn:', error);
-    return res.status(500).json({ message: 'Lỗi server khi gửi tin nhắn' });
+    console.error('Loi gui tin nhan:', error);
+    return res.status(500).json({ message: 'Loi server khi gui tin nhan' });
   }
 };
 
-// lấy tin nhắn giữa 2 người dùng hoặc 1 nhóm
 export const getMessages = async (req, res) => {
   try {
-    const userId1 = req.user._id.toString();
-    const targetId = req.params.userId; // Có thể là userId hoặc groupId
+    const userId = req.user._id.toString();
+    const targetId = req.params.userId;
     const isGroup = req.query.isGroup === 'true';
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 50;
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 50;
     const loadAll = req.query.loadAll === 'true';
 
     if (!targetId) {
-      return res.status(400).json({ message: 'targetId là bắt buộc' });
+      return res.status(400).json({ message: 'targetId la bat buoc' });
     }
 
-    let messages;
+    const query = buildConversationQuery({ userId, targetId, isGroup });
+    let messages = [];
     let totalMessages = 0;
     let hasMore = false;
-
-    const populateOptions = [
-      { path: 'senderId', select: '_id username fullName profilePicture checkMark' },
-      { path: 'receiverId', select: '_id username fullName profilePicture checkMark' },
-      {
-        path: 'replyTo',
-        populate: {
-          path: 'senderId',
-          select: 'username fullName'
-        }
-      }
-    ];
-
-    let query = {};
-    if (isGroup) {
-      query = { groupId: targetId };
-    } else {
-      query = {
-        $or: [
-          { senderId: userId1, receiverId: targetId },
-          { senderId: targetId, receiverId: userId1 },
-        ],
-      };
-    }
 
     if (loadAll) {
       messages = await Message.find(query)
         .populate(populateOptions)
         .sort({ createdAt: 1 })
         .lean();
-
       totalMessages = messages.length;
     } else {
       const skip = (page - 1) * limit;
-
       totalMessages = await Message.countDocuments(query);
-
       messages = await Message.find(query)
         .populate(populateOptions)
         .sort({ createdAt: -1 })
@@ -151,166 +204,105 @@ export const getMessages = async (req, res) => {
       hasMore = skip + limit < totalMessages;
     }
 
-    // Đánh dấu tin nhắn từ người khác là đã đọc
     const unreadMessageIds = messages
-      .filter(msg =>
-        msg.senderId._id.toString() !== userId1 &&
-        !isGroup && // Bỏ qua mark as read cho group hiện tại để đơn giản
-        msg.receiverId?._id?.toString() === userId1 &&
-        !msg.isRead
+      .filter(
+        (msg) =>
+          getIdString(msg.senderId) !== userId &&
+          !isGroup &&
+          getIdString(msg.receiverId) === userId &&
+          !msg.isRead
       )
-      .map(msg => msg._id);
+      .map((msg) => getIdString(msg._id));
 
     if (unreadMessageIds.length > 0) {
-      await Message.updateMany(
-        { _id: { $in: unreadMessageIds } },
-        { isRead: true }
-      );
+      await Message.updateMany({ _id: { $in: unreadMessageIds } }, { isRead: true });
 
       const io = getIO();
-      if (io) {
-        io.to(targetId).emit('messagesRead', {
-          messageIds: unreadMessageIds,
-          readBy: userId1
-        });
-      }
+      io.to(targetId).emit('messagesRead', {
+        messageIds: unreadMessageIds,
+        readBy: userId,
+      });
     }
 
-    // Format response data
-    const formattedMessages = messages.map(msg => {
-      // Xác định rõ ràng replyType cho từng message
-      let replyType = null;
-      let replyToWithType = null;
-      if (msg.replyTo && typeof msg.replyTo === 'object' && msg.replyTo.senderId) {
-        // Nếu senderId là object, lấy _id, nếu là string thì dùng luôn
-        const replySenderId = typeof msg.replyTo.senderId === 'object' ? msg.replyTo.senderId._id : msg.replyTo.senderId;
-        if (replySenderId && replySenderId.toString() === msg.senderId._id.toString()) {
-          replyType = 'self';
-        } else {
-          replyType = 'other';
-        }
-        // Gắn replyType vào replyTo object để FE phân biệt
-        replyToWithType = { ...msg.replyTo, replyType };
-      } else {
-        replyToWithType = msg.replyTo || null;
-      }
-      return {
-        _id: msg._id,
-        senderId: msg.senderId,
-        receiverId: msg.receiverId,
-        message: msg.message,
-        mediaUrl: msg.mediaUrl,
-        mediaType: msg.mediaType,
-        replyTo: replyToWithType,
-        isRead: unreadMessageIds.includes(msg._id.toString()) ? true : msg.isRead,
-        createdAt: msg.createdAt,
-        updatedAt: msg.updatedAt,
-        isOwnMessage: msg.senderId._id.toString() === userId1,
-        replyType // Thêm trường này vào mỗi message (nếu cần tổng thể)
-      };
-    });
-
     return res.status(200).json({
-      messages: formattedMessages,
+      messages: messages.map((msg) => toMessageResponse(msg, userId, unreadMessageIds)),
       pagination: {
         currentPage: page,
         totalMessages,
         hasMore,
-        messagesPerPage: limit
+        messagesPerPage: limit,
       },
-      unreadCount: unreadMessageIds.length
+      unreadCount: unreadMessageIds.length,
     });
-
   } catch (error) {
-    console.error('Lỗi lấy tin nhắn:', error);
-    return res.status(500).json({ message: 'Lỗi server khi lấy tin nhắn' });
+    console.error('Loi lay tin nhan:', error);
+    return res.status(500).json({ message: 'Loi server khi lay tin nhan' });
   }
 };
 
-// cuộn để lấy tin nhắn với phân trang
 export const getMessagesWithPagination = async (req, res) => {
   try {
-    const userId1 = req.user._id.toString();
+    const userId = req.user._id.toString();
     const targetId = req.params.userId;
     const isGroup = req.query.isGroup === 'true';
-    const before = req.query.before; // timestamp để load tin nhắn trước đó
-    const limit = parseInt(req.query.limit) || 20;
+    const before = req.query.before;
+    const limit = parseInt(req.query.limit, 10) || 20;
 
     if (!targetId) {
-      return res.status(400).json({ message: 'targetId là bắt buộc' });
+      return res.status(400).json({ message: 'targetId la bat buoc' });
     }
 
-    let query = {};
-    if (isGroup) {
-      query = { groupId: targetId };
-    } else {
-      query = {
-        $or: [
-          { senderId: userId1, receiverId: targetId },
-          { senderId: targetId, receiverId: userId1 },
-        ],
-      };
-    }
-
-    // Nếu có before timestamp, chỉ lấy tin nhắn trước thời điểm đó
+    const query = buildConversationQuery({ userId, targetId, isGroup });
     if (before) {
       query.createdAt = { $lt: new Date(before) };
     }
 
     const messages = await Message.find(query)
-      .populate('senderId', '_id username fullName profilePicture checkMark')
-      .populate('receiverId', '_id username fullName profilePicture checkMark')
+      .populate(populateOptions)
       .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
 
-    // Đảo ngược để hiển thị từ cũ đến mới
     messages.reverse();
 
-    // Kiểm tra còn tin nhắn cũ hơn không
     const oldestMessage = messages.length > 0 ? messages[0] : null;
-    const hasMore = oldestMessage ? await Message.exists({
-      ...query,
-      createdAt: { $lt: oldestMessage.createdAt }
-    }) : false;
+    const hasMore = oldestMessage
+      ? await Message.exists({
+          ...query,
+          createdAt: { $lt: oldestMessage.createdAt },
+        })
+      : false;
 
     return res.status(200).json({
-      messages: messages.map(msg => ({
-        ...msg,
-        isOwnMessage: msg.senderId._id.toString() === userId1
-      })),
-      hasMore,
-      oldestTimestamp: oldestMessage?.createdAt || null
+      messages: messages.map((msg) => toMessageResponse(msg, userId)),
+      hasMore: !!hasMore,
+      oldestTimestamp: oldestMessage?.createdAt || null,
     });
-
   } catch (error) {
-    console.error('Lỗi lấy tin nhắn phân trang:', error);
-    return res.status(500).json({ message: 'Lỗi server khi lấy tin nhắn' });
+    console.error('Loi lay tin nhan phan trang:', error);
+    return res.status(500).json({ message: 'Loi server khi lay tin nhan' });
   }
 };
 
-// Lấy số lượng tin nhắn chưa đọc
 export const getUnreadCount = async (req, res) => {
   try {
     const senderId = req.params.senderId;
     const receiverId = req.query.receiverId;
 
     if (!senderId || !receiverId) {
-      return res.status(400).json({ message: 'Thiếu senderId hoặc receiverId' });
+      return res.status(400).json({ message: 'Thieu senderId hoac receiverId' });
     }
 
-    // Đếm số lượng tin nhắn chưa đọc từ senderId gửi cho receiverId
     const count = await Message.countDocuments({
       senderId,
       receiverId,
-      isRead: false
+      isRead: false,
     });
 
-    // Lấy tin nhắn chưa đọc mới nhất từ senderId gửi cho receiverId
     const latestUnread = await Message.findOne({
       senderId,
       receiverId,
-      isRead: false
+      isRead: false,
     })
       .sort({ createdAt: -1 })
       .select('message')
@@ -318,15 +310,14 @@ export const getUnreadCount = async (req, res) => {
 
     return res.status(200).json({
       unreadCount: count,
-      message: latestUnread ? latestUnread.message : null
+      message: latestUnread ? latestUnread.message : null,
     });
   } catch (error) {
-    console.error('Lỗi khi lấy số tin nhắn chưa đọc:', error);
-    return res.status(500).json({ message: 'Lỗi server' });
+    console.error('Loi lay so tin nhan chua doc:', error);
+    return res.status(500).json({ message: 'Loi server' });
   }
 };
 
-// trạng thái online/ offline của người dùng
 export const checkUserStatus = async (req, res) => {
   try {
     const { identifier } = req.params;
@@ -335,26 +326,27 @@ export const checkUserStatus = async (req, res) => {
 
     let user;
     if (identifier.match(/^[0-9a-fA-F]{24}$/)) {
-      user = await User.findById(identifier)
-        .select('username lastActive lastOnline isOnline');
+      user = await User.findById(identifier).select(
+        'username lastActive lastOnline isOnline isBot'
+      );
     } else {
-      user = await User.findOne({ username: identifier })
-        .select('username lastActive lastOnline isOnline');
+      user = await User.findOne({ username: identifier }).select(
+        'username lastActive lastOnline isOnline isBot'
+      );
     }
 
     if (!user) {
       return res.status(404).json({
         success: false,
-        message: 'Không tìm thấy người dùng'
+        message: 'Khong tim thay nguoi dung',
       });
     }
 
-    const isOnline = onlineUsers.has(user._id.toString());
+    const isOnline = user.isBot ? true : onlineUsers.has(user._id.toString());
 
-    // Nếu user offline và lastOnline là null, cập nhật lastOnline bằng lastActive
-    if (!isOnline && !user.lastOnline && user.lastActive) {
+    if (!user.isBot && !isOnline && !user.lastOnline && user.lastActive) {
       await User.findByIdAndUpdate(user._id, {
-        lastOnline: user.lastActive
+        lastOnline: user.lastActive,
       });
       user.lastOnline = user.lastActive;
     }
@@ -365,18 +357,17 @@ export const checkUserStatus = async (req, res) => {
       username: user.username,
       status: isOnline ? 'online' : 'offline',
       lastActive: user.lastActive || new Date(),
-      lastOnline: user.lastOnline || user.lastActive || new Date()
+      lastOnline: user.lastOnline || user.lastActive || new Date(),
     });
   } catch (error) {
-    console.error('Lỗi kiểm tra trạng thái:', error);
+    console.error('Loi kiem tra trang thai:', error);
     return res.status(500).json({
       success: false,
-      message: 'Lỗi server khi kiểm tra trạng thái online'
+      message: 'Loi server khi kiem tra trang thai online',
     });
   }
 };
 
-// lấy danh sách người dùng để nhắn tin
 export const getUserMessages = async (req, res) => {
   try {
     const userId = req.user._id.toString();
@@ -385,87 +376,84 @@ export const getUserMessages = async (req, res) => {
     const Story = (await import('../models/story.model.js')).default;
 
     const users = await User.find({ _id: { $ne: userId } })
-      .select('_id username profilePicture checkMark lastActive lastOnline');
+      .select('_id username fullName profilePicture checkMark lastActive lastOnline isBot')
+      .sort({ isBot: -1, username: 1 });
 
-    // Lấy danh sách userId
-    const userIds = users.map(u => u._id);
-    // Lấy các user có story đang hoạt động
+    const userIds = users.filter((user) => !user.isBot).map((user) => user._id);
     const stories = await Story.aggregate([
       {
         $match: {
           author: { $in: userIds },
           isArchived: false,
-          expiresAt: { $gt: new Date() }
-        }
+          expiresAt: { $gt: new Date() },
+        },
       },
       {
-        $group: { _id: '$author' }
-      }
+        $group: { _id: '$author' },
+      },
     ]);
-    const usersWithStory = new Set(stories.map(s => s._id.toString()));
 
-    const usersWithStatus = users.map(u => ({
-      _id: u._id,
-      username: u.username,
-      profilePicture: u.profilePicture,
-      checkMark: !!u.checkMark,
-      isOnline: onlineUsers.has(u._id.toString()),
-      lastActive: u.lastActive,
-      lastOnline: u.lastOnline,
-      hasStory: usersWithStory.has(u._id.toString())
-    }));
+    const usersWithStory = new Set(stories.map((story) => story._id.toString()));
 
-    return res.status(200).json(usersWithStatus);
+    return res.status(200).json(
+      users.map((user) => ({
+        _id: user._id,
+        username: user.username,
+        fullName: user.fullName,
+        profilePicture: user.profilePicture,
+        checkMark: !!user.checkMark,
+        isBot: !!user.isBot,
+        isOnline: user.isBot ? true : onlineUsers.has(user._id.toString()),
+        lastActive: user.lastActive,
+        lastOnline: user.lastOnline,
+        hasStory: !user.isBot && usersWithStory.has(user._id.toString()),
+      }))
+    );
   } catch (error) {
-    console.error('Lỗi lấy danh sách user:', error);
-    return res.status(500).json({ message: 'Lỗi server khi lấy danh sách user' });
+    console.error('Loi lay danh sach user:', error);
+    return res.status(500).json({ message: 'Loi server khi lay danh sach user' });
   }
 };
 
-// Thêm controller mới
 export const getRecentChats = async (req, res) => {
   try {
     const userId = req.user._id;
     const io = getIO();
     const onlineUsers = io.onlineUsers || new Map();
 
-    // Lấy tin nhắn mới nhất cho mỗi cuộc trò chuyện
     const recentMessages = await Message.aggregate([
       {
         $match: {
-          $or: [
-            { senderId: userId },
-            { receiverId: userId }
-          ],
-          groupId: null // Chỉ lấy tin nhắn cá nhân
-        }
+          $or: [{ senderId: userId }, { receiverId: userId }],
+          groupId: null,
+        },
       },
       {
-        $sort: { createdAt: -1 }
+        $sort: { createdAt: -1 },
       },
       {
         $group: {
           _id: {
             $cond: {
-              if: { $eq: ["$senderId", userId] },
-              then: "$receiverId",
-              else: "$senderId"
-            }
+              if: { $eq: ['$senderId', userId] },
+              then: '$receiverId',
+              else: '$senderId',
+            },
           },
-          messageId: { $first: "$_id" },
-          lastMessage: { $first: "$message" },
-          senderId: { $first: "$senderId" },
-          createdAt: { $first: "$createdAt" },
-          isRead: { $first: "$isRead" }
-        }
-      }
+          messageId: { $first: '$_id' },
+          lastMessage: { $first: '$message' },
+          senderId: { $first: '$senderId' },
+          createdAt: { $first: '$createdAt' },
+          isRead: { $first: '$isRead' },
+        },
+      },
     ]);
 
-    // Lấy thông tin user cho mỗi cuộc trò chuyện
     const chatList = await Promise.all(
       recentMessages.map(async (chat) => {
-        const otherUser = await User.findById(chat._id)
-          .select('username profilePicture checkMark lastActive lastOnline');
+        const otherUser = await User.findById(chat._id).select(
+          'username fullName profilePicture checkMark lastActive lastOnline isBot'
+        );
 
         if (!otherUser) return null;
 
@@ -473,38 +461,44 @@ export const getRecentChats = async (req, res) => {
           user: {
             _id: otherUser._id,
             username: otherUser.username,
+            fullName: otherUser.fullName,
             profilePicture: otherUser.profilePicture,
             checkMark: !!otherUser.checkMark,
-            isOnline: onlineUsers.has(otherUser._id.toString()),
+            isBot: !!otherUser.isBot,
+            isOnline: otherUser.isBot
+              ? true
+              : onlineUsers.has(otherUser._id.toString()),
             lastActive: otherUser.lastActive,
-            lastOnline: otherUser.lastOnline
+            lastOnline: otherUser.lastOnline,
           },
           lastMessage: {
             _id: chat.messageId,
             message: chat.lastMessage,
             isOwnMessage: chat.senderId.equals(userId),
             createdAt: chat.createdAt,
-            isRead: chat.isRead
-          }
+            isRead: chat.isRead,
+          },
         };
       })
     );
 
-    // Lọc bỏ các null và sắp xếp theo thời gian tin nhắn mới nhất
     const filteredChats = chatList
-      .filter(chat => chat !== null)
-      .sort((a, b) => b.lastMessage.createdAt - a.lastMessage.createdAt);
+      .filter(Boolean)
+      .sort(
+        (a, b) =>
+          new Date(b.lastMessage.createdAt).getTime() -
+          new Date(a.lastMessage.createdAt).getTime()
+      );
 
     return res.status(200).json(filteredChats);
   } catch (error) {
-    console.error('Lỗi khi lấy danh sách chat gần đây:', error);
+    console.error('Loi lay danh sach chat gan day:', error);
     return res.status(500).json({
-      message: 'Lỗi server khi lấy danh sách chat gần đây'
+      message: 'Loi server khi lay danh sach chat gan day',
     });
   }
 };
 
-// đánh dấu tin nhắn đã đọc
 export const markMessagesAsRead = async (req, res) => {
   try {
     const { messageIds, senderId } = req.body;
@@ -512,109 +506,112 @@ export const markMessagesAsRead = async (req, res) => {
 
     if (!messageIds || !Array.isArray(messageIds) || !senderId) {
       return res.status(400).json({
-        message: 'messageIds (array) và senderId là bắt buộc'
+        message: 'messageIds (array) va senderId la bat buoc',
       });
     }
 
-    // Cập nhật trạng thái đã đọc cho các tin nhắn
     await Message.updateMany(
       {
         _id: { $in: messageIds },
-        senderId: senderId,
-        receiverId: receiverId
+        senderId,
+        receiverId,
       },
       { isRead: true }
     );
 
     const io = getIO();
+    const receiver = await User.findById(receiverId).select(
+      'username profilePicture checkMark lastActive lastOnline isBot'
+    );
 
-    // Lấy thông tin user để gửi về
-    const receiver = await User.findById(receiverId)
-      .select('username profilePicture checkMark lastActive lastOnline');
-
-    // Tạo object chứa thông tin cập nhật
     const updateData = {
       user: {
         _id: receiver._id,
         username: receiver.username,
         profilePicture: receiver.profilePicture,
         checkMark: !!receiver.checkMark,
-        isOnline: io.onlineUsers.has(receiver._id.toString()),
+        isBot: !!receiver.isBot,
+        isOnline: receiver.isBot
+          ? true
+          : io.onlineUsers.has(receiver._id.toString()),
         lastActive: receiver.lastActive,
-        lastOnline: receiver.lastOnline
+        lastOnline: receiver.lastOnline,
       },
-      messages: messageIds.map(id => ({
+      messages: messageIds.map((id) => ({
         messageId: id,
-        isRead: true
-      }))
+        isRead: true,
+      })),
     };
 
-    // Emit cho người gửi tin nhắn
     io.to(senderId.toString()).emit('messagesStatusUpdate', updateData);
-
-    // Emit cho người nhận tin nhắn
     io.to(receiverId.toString()).emit('messagesStatusUpdate', updateData);
-
-    // Emit cập nhật trạng thái trong recent chats
     io.to(senderId.toString()).emit('updateRecentChat', {
       userId: receiverId,
       lastMessageId: messageIds[messageIds.length - 1],
-      isRead: true
+      isRead: true,
     });
 
     return res.status(200).json({
       success: true,
-      message: 'Đã cập nhật trạng thái đọc tin nhắn'
+      message: 'Da cap nhat trang thai doc tin nhan',
     });
-
   } catch (error) {
-    console.error('Lỗi khi đánh dấu tin nhắn đã đọc:', error);
+    console.error('Loi danh dau tin nhan da doc:', error);
     return res.status(500).json({
-      message: 'Lỗi server khi đánh dấu tin nhắn đã đọc'
+      message: 'Loi server khi danh dau tin nhan da doc',
     });
   }
 };
 
-// Xóa tất cả tin nhắn giữa 2 user (bao gồm cả media trên Cloudinary)
 export const deleteMessagesBetweenUsers = async (req, res) => {
   try {
     const userId1 = req.user._id.toString();
     const userId2 = req.params.userId;
+
     if (!userId2) {
-      return res.status(400).json({ message: 'userId là bắt buộc' });
+      return res.status(400).json({ message: 'userId la bat buoc' });
     }
-    // Lấy tất cả tin nhắn giữa 2 user
+
     const messages = await Message.find({
       $or: [
         { senderId: userId1, receiverId: userId2 },
         { senderId: userId2, receiverId: userId1 },
       ],
     });
-    // Xóa media trên Cloudinary nếu có
+
     for (const msg of messages) {
-      if (msg.mediaUrl) {
-        // Lấy public_id từ url cloudinary
-        const match = msg.mediaUrl.match(/\/([^\/]+)\.(jpg|jpeg|png|mp4|webp|gif)$/i);
-        if (match) {
-          const publicId = msg.mediaUrl.split('/').slice(-2).join('/').replace(/\.(jpg|jpeg|png|mp4|webp|gif)$/i, '');
-          try {
-            await cloudinary.uploader.destroy(publicId, { resource_type: msg.mediaType === 'video' ? 'video' : 'image' });
-          } catch (err) {
-            console.error('Lỗi xóa media Cloudinary:', err);
-          }
-        }
+      if (!msg.mediaUrl) continue;
+
+      const publicId = msg.mediaUrl
+        .split('/')
+        .slice(-2)
+        .join('/')
+        .replace(/\.(jpg|jpeg|png|mp4|webp|gif)$/i, '');
+
+      if (!publicId) continue;
+
+      try {
+        await cloudinary.uploader.destroy(publicId, {
+          resource_type: msg.mediaType === 'video' ? 'video' : 'image',
+        });
+      } catch (err) {
+        console.error('Loi xoa media Cloudinary:', err);
       }
     }
-    // Xóa tin nhắn trong MongoDB
+
     await Message.deleteMany({
       $or: [
         { senderId: userId1, receiverId: userId2 },
         { senderId: userId2, receiverId: userId1 },
       ],
     });
-    return res.status(200).json({ success: true, message: 'Đã xóa toàn bộ tin nhắn giữa 2 người dùng' });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Da xoa toan bo tin nhan giua 2 nguoi dung',
+    });
   } catch (error) {
-    console.error('Lỗi khi xóa tin nhắn giữa 2 user:', error);
-    return res.status(500).json({ message: 'Lỗi server khi xóa tin nhắn' });
+    console.error('Loi xoa tin nhan giua 2 user:', error);
+    return res.status(500).json({ message: 'Loi server khi xoa tin nhan' });
   }
 };

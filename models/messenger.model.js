@@ -43,6 +43,10 @@ const messageSchema = new mongoose.Schema({
     enum: [null, 'image', 'video'],
     default: null,
   },
+  botPayload: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null,
+  },
 }, { timestamps: true });
 
 messageSchema.index({ senderId: 1, receiverId: 1 });
