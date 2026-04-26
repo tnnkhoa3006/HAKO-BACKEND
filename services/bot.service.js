@@ -7,9 +7,26 @@ dotenv.config();
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_BOT_MODEL || 'gemini-3-flash-preview';
+
 const SEARCH_PAGE_SIZE = 3;
 const MIN_SEARCH_TOKEN_LENGTH = 3;
 const MIN_SEARCH_SCORE = 5;
+const MAX_SEARCH_TOPICS = 5;
+const MAX_SEARCH_PHRASES = 8;
+const MAX_SEARCH_TOKENS = 12;
+const MAX_REGEX_TERMS = 10;
+
+const BOT_USERNAME = process.env.HAKOBOT_USERNAME || 'hakobot';
+const BOT_FULL_NAME = process.env.HAKOBOT_FULL_NAME || 'HakoBot';
+const BOT_EMAIL = process.env.HAKOBOT_EMAIL || 'hakobot@hako.local';
+const BOT_PASSWORD = process.env.HAKOBOT_PASSWORD || 'Hakobot@123!';
+const BOT_AVATAR =
+  process.env.HAKOBOT_AVATAR_URL ||
+  'https://res.cloudinary.com/dan2u3wbc/image/upload/v1777040300/instagram_vza3tq.png';
+const BOT_BIO =
+  process.env.HAKOBOT_BIO ||
+  'Tro ly AI cua Hako. Toi co the goi y caption, tro chuyen va tim bai viet lien quan.';
+
 const SEARCH_STOP_WORDS = new Set([
   'tim',
   'kiem',
@@ -38,24 +55,50 @@ const SEARCH_STOP_WORDS = new Set([
   'di',
 ]);
 
-const BOT_USERNAME = process.env.HAKOBOT_USERNAME || 'hakobot';
-const BOT_FULL_NAME = process.env.HAKOBOT_FULL_NAME || 'HakoBot';
-const BOT_EMAIL = process.env.HAKOBOT_EMAIL || 'hakobot@hako.local';
-const BOT_PASSWORD = process.env.HAKOBOT_PASSWORD || 'Hakobot@123!';
-const BOT_AVATAR =
-  process.env.HAKOBOT_AVATAR_URL ||
-  'https://res.cloudinary.com/dan2u3wbc/image/upload/v1777040300/instagram_vza3tq.png';
-const BOT_BIO =
-  process.env.HAKOBOT_BIO ||
-  'Tro ly AI cua Hako. Toi co the goi y caption, tro chuyen va tim bai viet lien quan.';
+const SEARCH_RESULT_FIELDS =
+  'caption desc type fileUrl aiSummary aiTopics author createdAt';
+
+const SEARCH_SUGGESTION = {
+  label: 'Xem thêm',
+  prompt: 'Xem thêm',
+};
+
+const CHAT_SUGGESTIONS = [
+  {
+    label: 'Gợi ý caption',
+    prompt: 'Gợi ý cho mình vài caption về du lịch',
+  },
+  {
+    label: 'Tìm bài viết',
+    prompt: 'Tìm cho mình bài viết về ẩm thực',
+  },
+];
+
+const SHOW_MORE_FALLBACK_SUGGESTION = {
+  label: 'Tìm bài ẩm thực',
+  prompt: 'Tìm cho mình bài viết về ẩm thực',
+};
 
 export const BOT_USER_SELECT_FIELDS =
   '_id username fullName profilePicture checkMark lastActive lastOnline isBot';
 
+const BOT_REPLY_MESSAGES = {
+  emptyInput:
+    'Mình hiện hỗ trợ tốt nhất với tin nhắn văn bản. Bạn thử mô tả chủ đề hoặc yêu cầu cụ thể nhé.',
+  missingSearchContext:
+    'Bạn hãy yêu cầu mình tìm bài viết trước, ví dụ: "Tìm cho mình bài viết về ẩm thực".',
+  noSearchResults:
+    'Mình chưa tìm thấy bài viết phù hợp. Bạn thử đổi chủ đề hoặc mô tả cụ thể hơn nhé.',
+  noMoreSearchResults:
+    'Mình đã hết kết quả phù hợp cho lần tìm kiếm này rồi.',
+  defaultChat:
+    'Mình đây. Bạn có thể nhờ mình gợi ý caption hoặc tìm bài viết theo chủ đề bất kỳ.',
+};
+
 const stripDiacritics = (value = '') =>
   String(value)
-    .replace(/đ/g, 'd')
-    .replace(/Đ/g, 'D')
+    .replace(/\u0111/g, 'd')
+    .replace(/\u0110/g, 'D')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '');
 
@@ -99,142 +142,7 @@ const tokenizeSearchText = (value = '') =>
         !SEARCH_STOP_WORDS.has(token)
     );
 
-const toWordSet = (value = '') =>
-  new Set(tokenizeSearchText(value).filter(Boolean));
-
-const buildSearchTerms = ({ query = '', topics = [] }) => {
-  const phraseSources = uniqueStrings(
-    [extractTopicHint(query), ...topics]
-      .map((value) => String(value || '').trim())
-      .filter(Boolean)
-  );
-
-  const normalizedPhrases = uniqueStrings(
-    phraseSources.map((value) => normalizeSearchIndexText(value)).filter(Boolean)
-  ).slice(0, 8);
-
-  const tokens = uniqueStrings([
-    ...normalizedPhrases.flatMap((phrase) => phrase.split(' ')),
-    ...tokenizeSearchText(query),
-    ...topics.flatMap((topic) => tokenizeSearchText(topic)),
-  ]).slice(0, 12);
-
-  return {
-    phrases: phraseSources.slice(0, 8),
-    normalizedPhrases,
-    tokens,
-  };
-};
-
-const buildMongoSearchQuery = (searchTerms) => {
-  const rawTerms = uniqueStrings([
-    ...searchTerms.phrases,
-    ...searchTerms.tokens.filter(
-      (token) => token.length >= MIN_SEARCH_TOKEN_LENGTH
-    ),
-  ]).slice(0, 10);
-
-  if (!rawTerms.length) {
-    return null;
-  }
-
-  const regexes = rawTerms.map((term) => new RegExp(escapeRegex(term), 'i'));
-
-  return {
-    $or: regexes.flatMap((regex) => [
-      { aiTopics: regex },
-      { caption: regex },
-      { desc: regex },
-      { aiSummary: regex },
-    ]),
-  };
-};
-
-const countPhraseMatches = (texts = [], terms = []) =>
-  terms.reduce(
-    (count, term) =>
-      count + (texts.some((text) => !!text && text.includes(term)) ? 1 : 0),
-    0
-  );
-
-const countWordMatches = (wordSets = [], terms = []) =>
-  terms.reduce(
-    (count, term) => count + (wordSets.some((wordSet) => wordSet.has(term)) ? 1 : 0),
-    0
-  );
-
-const scorePostAgainstSearch = (post, searchTerms) => {
-  const normalizedAiTopics = Array.isArray(post.aiTopics)
-    ? post.aiTopics
-        .map((topic) => normalizeSearchIndexText(topic))
-        .filter(Boolean)
-    : [];
-  const captionText = normalizeSearchIndexText(post.caption || '');
-  const descText = normalizeSearchIndexText(post.desc || '');
-  const summaryText = normalizeSearchIndexText(post.aiSummary || '');
-
-  const aiTopicWordSets = normalizedAiTopics.map((topic) => toWordSet(topic));
-  const bodyWordSets = [captionText, summaryText, descText]
-    .filter(Boolean)
-    .map((text) => toWordSet(text));
-
-  const aiTopicPhraseMatches = countPhraseMatches(
-    normalizedAiTopics,
-    searchTerms.normalizedPhrases
-  );
-  const captionPhraseMatches = countPhraseMatches(
-    [captionText],
-    searchTerms.normalizedPhrases
-  );
-  const summaryPhraseMatches = countPhraseMatches(
-    [summaryText],
-    searchTerms.normalizedPhrases
-  );
-  const descPhraseMatches = countPhraseMatches(
-    [descText],
-    searchTerms.normalizedPhrases
-  );
-  const aiTopicTokenMatches = countWordMatches(aiTopicWordSets, searchTerms.tokens);
-  const bodyTokenMatches = countWordMatches(bodyWordSets, searchTerms.tokens);
-
-  const hasStrongPhraseMatch =
-    aiTopicPhraseMatches > 0 ||
-    captionPhraseMatches > 0 ||
-    summaryPhraseMatches > 0 ||
-    descPhraseMatches > 0;
-
-  const distinctTokenMatchCount = aiTopicTokenMatches + bodyTokenMatches;
-
-  let score = 0;
-
-  score += aiTopicPhraseMatches * 12;
-  score += captionPhraseMatches * 8;
-  score += summaryPhraseMatches * 6;
-  score += descPhraseMatches * 5;
-  score += aiTopicTokenMatches * 3;
-  score += bodyTokenMatches * 2;
-
-  if (!hasStrongPhraseMatch && distinctTokenMatchCount < 2) {
-    return 0;
-  }
-
-  return score >= MIN_SEARCH_SCORE ? score : 0;
-};
-
-const getSearchDisplayLabel = ({ query = '', topics = [] }) => {
-  const label =
-    topics.join(', ') ||
-    extractTopicHint(query) ||
-    truncate(
-      tokenizeSearchText(query)
-        .slice(0, 5)
-        .join(' '),
-      60
-    ) ||
-    truncate(query, 60);
-
-  return label || 'chủ đề bạn đang quan tâm';
-};
+const toWordSet = (value = '') => new Set(tokenizeSearchText(value));
 
 const parseGeminiJson = (content = '') => {
   if (!content) return null;
@@ -259,21 +167,23 @@ const callGeminiJson = async (prompt) => {
   }
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': GEMINI_API_KEY,
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [{ text: prompt }],
-          },
-        ],
-      }),
-    });
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [{ text: prompt }],
+            },
+          ],
+        }),
+      }
+    );
 
     if (!response.ok) {
       console.error('HakoBot Gemini API error status:', response.status);
@@ -302,13 +212,13 @@ const extractTopicHint = (text = '') => {
 };
 
 const buildFallbackCaptionSuggestions = (topic) => {
-  const safeTopic = topic || 'chu de ban dang quan tam';
+  const safeTopic = topic || 'chủ đề bạn đang quan tâm';
   return [
-    `Chut nang, chut gio va that nhieu cam hung cho ${safeTopic}.`,
-    `Khong can qua cau ky, chi can dung tam trang la ${safeTopic} da du hay ho.`,
-    `Them mot ngay dep de luu lai nhung dieu dang nho ve ${safeTopic}.`,
-    `Dang mot chut ${safeTopic}, giu lai mot chut cam xuc that rieng cua minh.`,
-    `Neu hom nay can mot ly do de vui, co le ${safeTopic} la cau tra loi.`,
+    `Chút nắng, chút gió và thật nhiều cảm hứng cho ${safeTopic}.`,
+    `Không cần quá cầu kỳ, chỉ cần đúng tâm trạng là ${safeTopic} đã đủ hay ho.`,
+    `Thêm một ngày đẹp để lưu lại những điều đáng nhớ về ${safeTopic}.`,
+    `Đăng một chút ${safeTopic}, giữ lại một chút cảm xúc thật riêng của mình.`,
+    `Nếu hôm nay cần một lý do để vui, có lẽ ${safeTopic} là câu trả lời.`,
   ];
 };
 
@@ -347,9 +257,7 @@ const fallbackIntentClassifier = (messageText) => {
   };
 };
 
-const classifyIntentWithGemini = async (messageText) => {
-  const fallback = fallbackIntentClassifier(messageText);
-  const parsed = await callGeminiJson(`
+const buildIntentPrompt = (messageText) => `
 Ban la bo phan tich intent cho HakoBot.
 Phan loai tin nhan cua nguoi dung thanh mot trong ba intent:
 - "caption": nguoi dung muon goi y caption, status, noi dung bai dang.
@@ -357,7 +265,7 @@ Phan loai tin nhan cua nguoi dung thanh mot trong ba intent:
 - "chat": tro chuyen thong thuong hoac hoi dap chung.
 
 Neu intent = "search":
-- Trich xuat toi da 5 topics lien quan voi cach nguoi dung mo ta.
+- Trich xuat toi da ${MAX_SEARCH_TOPICS} topics lien quan voi cach nguoi dung mo ta.
 - Uu tien giu ca topic cu the neu co (vi du: Bong da, Du lich bien), co the them topic rong hon neu thuc su can.
 - Topics phai bang tieng Viet, viet hoa chu cai dau.
 
@@ -373,18 +281,20 @@ Khong them markdown, khong them giai thich.
 
 Tin nhan nguoi dung:
 ${messageText}
-  `);
+`;
+
+const classifyIntentWithGemini = async (messageText) => {
+  const fallback = fallbackIntentClassifier(messageText);
+  const parsed = await callGeminiJson(buildIntentPrompt(messageText));
 
   if (!parsed || typeof parsed !== 'object') {
     return fallback;
   }
 
-  const intent = ['caption', 'search', 'chat'].includes(parsed.intent)
-    ? parsed.intent
-    : fallback.intent;
-
   return {
-    intent,
+    intent: ['caption', 'search', 'chat'].includes(parsed.intent)
+      ? parsed.intent
+      : fallback.intent,
     captionPrompt:
       typeof parsed.captionPrompt === 'string' && parsed.captionPrompt.trim()
         ? parsed.captionPrompt.trim()
@@ -397,22 +307,144 @@ ${messageText}
       ? parsed.topics
           .map((topic) => toTitleCase(topic))
           .filter(Boolean)
-          .slice(0, 5)
+          .slice(0, MAX_SEARCH_TOPICS)
       : fallback.topics,
   };
 };
 
-const isShowMoreCommand = (messageText = '') => {
-  const normalizedText = normalizeLooseText(messageText);
-  return [
-    'xem them',
-    'them',
-    'xem tiep',
-    'tiep',
-    'more',
-    'show more',
-  ].includes(normalizedText);
+const isShowMoreCommand = (messageText = '') =>
+  ['xem them', 'them', 'xem tiep', 'tiep', 'more', 'show more'].includes(
+    normalizeLooseText(messageText)
+  );
+
+const buildSearchTerms = ({ query = '', topics = [] }) => {
+  const phrases = uniqueStrings(
+    [extractTopicHint(query), ...topics]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+  ).slice(0, MAX_SEARCH_PHRASES);
+
+  const normalizedPhrases = uniqueStrings(
+    phrases.map((value) => normalizeSearchIndexText(value)).filter(Boolean)
+  ).slice(0, MAX_SEARCH_PHRASES);
+
+  const tokens = uniqueStrings([
+    ...normalizedPhrases.flatMap((phrase) => phrase.split(' ')),
+    ...tokenizeSearchText(query),
+    ...topics.flatMap((topic) => tokenizeSearchText(topic)),
+  ]).slice(0, MAX_SEARCH_TOKENS);
+
+  return {
+    phrases,
+    normalizedPhrases,
+    tokens,
+  };
 };
+
+const buildMongoSearchQuery = (searchTerms) => {
+  const rawTerms = uniqueStrings([
+    ...searchTerms.phrases,
+    ...searchTerms.tokens.filter(
+      (token) => token.length >= MIN_SEARCH_TOKEN_LENGTH
+    ),
+  ]).slice(0, MAX_REGEX_TERMS);
+
+  if (!rawTerms.length) {
+    return null;
+  }
+
+  const regexes = rawTerms.map((term) => new RegExp(escapeRegex(term), 'i'));
+
+  return {
+    $or: regexes.flatMap((regex) => [
+      { aiTopics: regex },
+      { caption: regex },
+      { desc: regex },
+      { aiSummary: regex },
+    ]),
+  };
+};
+
+const countPhraseMatches = (texts = [], terms = []) =>
+  terms.reduce(
+    (count, term) =>
+      count + (texts.some((text) => text && text.includes(term)) ? 1 : 0),
+    0
+  );
+
+const countWordMatches = (wordSets = [], terms = []) =>
+  terms.reduce(
+    (count, term) =>
+      count + (wordSets.some((wordSet) => wordSet.has(term)) ? 1 : 0),
+    0
+  );
+
+const scorePostAgainstSearch = (post, searchTerms) => {
+  const normalizedAiTopics = Array.isArray(post.aiTopics)
+    ? post.aiTopics
+        .map((topic) => normalizeSearchIndexText(topic))
+        .filter(Boolean)
+    : [];
+  const captionText = normalizeSearchIndexText(post.caption || '');
+  const descText = normalizeSearchIndexText(post.desc || '');
+  const summaryText = normalizeSearchIndexText(post.aiSummary || '');
+
+  const aiTopicWordSets = normalizedAiTopics.map((topic) => toWordSet(topic));
+  const bodyWordSets = [captionText, summaryText, descText]
+    .filter(Boolean)
+    .map((text) => toWordSet(text));
+
+  const aiTopicPhraseMatches = countPhraseMatches(
+    normalizedAiTopics,
+    searchTerms.normalizedPhrases
+  );
+  const captionPhraseMatches = countPhraseMatches(
+    [captionText],
+    searchTerms.normalizedPhrases
+  );
+  const summaryPhraseMatches = countPhraseMatches(
+    [summaryText],
+    searchTerms.normalizedPhrases
+  );
+  const descPhraseMatches = countPhraseMatches(
+    [descText],
+    searchTerms.normalizedPhrases
+  );
+  const aiTopicTokenMatches = countWordMatches(
+    aiTopicWordSets,
+    searchTerms.tokens
+  );
+  const bodyTokenMatches = countWordMatches(bodyWordSets, searchTerms.tokens);
+
+  const hasStrongPhraseMatch =
+    aiTopicPhraseMatches > 0 ||
+    captionPhraseMatches > 0 ||
+    summaryPhraseMatches > 0 ||
+    descPhraseMatches > 0;
+
+  const distinctTokenMatchCount = aiTopicTokenMatches + bodyTokenMatches;
+
+  const score =
+    aiTopicPhraseMatches * 12 +
+    captionPhraseMatches * 8 +
+    summaryPhraseMatches * 6 +
+    descPhraseMatches * 5 +
+    aiTopicTokenMatches * 3 +
+    bodyTokenMatches * 2;
+
+  if (!hasStrongPhraseMatch && distinctTokenMatchCount < 2) {
+    return 0;
+  }
+
+  return score >= MIN_SEARCH_SCORE ? score : 0;
+};
+
+const getSearchDisplayLabel = ({ query = '', topics = [] }) =>
+  topics.join(', ') ||
+  extractTopicHint(query) ||
+  truncate(tokenizeSearchText(query).slice(0, 5).join(' '), 60) ||
+  truncate(query, 60) ||
+  'chủ đề bạn đang quan tâm';
 
 const findLatestSearchContext = async (userId, botId) => {
   const latestSearchReply = await Message.findOne({
@@ -440,11 +472,7 @@ const findLatestSearchContext = async (userId, botId) => {
   };
 };
 
-const searchPostsByTopics = async (
-  { query = '', topics = [] },
-  offset = 0,
-  limit = SEARCH_PAGE_SIZE
-) => {
+const searchPosts = async ({ query = '', topics = [] }, offset = 0) => {
   const searchTerms = buildSearchTerms({ query, topics });
 
   if (!searchTerms.normalizedPhrases.length && !searchTerms.tokens.length) {
@@ -457,17 +485,12 @@ const searchPostsByTopics = async (
   }
 
   const mongoSearchQuery = buildMongoSearchQuery(searchTerms);
-  const searchProjection =
-    'caption desc type fileUrl aiSummary aiTopics author createdAt';
-
-  let candidates = [];
-
-  if (mongoSearchQuery) {
-    candidates = await Post.find(mongoSearchQuery)
-      .sort({ createdAt: -1 })
-      .select(searchProjection)
-      .lean();
-  }
+  const candidates = mongoSearchQuery
+    ? await Post.find(mongoSearchQuery)
+        .sort({ createdAt: -1 })
+        .select(SEARCH_RESULT_FIELDS)
+        .lean()
+    : [];
 
   const rankedPosts = candidates
     .map((post) => ({
@@ -485,8 +508,7 @@ const searchPostsByTopics = async (
       );
     });
 
-  const posts = rankedPosts.slice(offset, offset + limit);
-
+  const posts = rankedPosts.slice(offset, offset + SEARCH_PAGE_SIZE);
   await Post.populate(posts, {
     path: 'author',
     select: '_id username fullName profilePicture checkMark isBot',
@@ -514,7 +536,10 @@ const mapSearchResultPost = (post) => ({
     80
   ),
   excerpt: truncate(
-    post.aiSummary || post.desc || post.caption || 'Mo bai viet de xem them noi dung.',
+    post.aiSummary ||
+      post.desc ||
+      post.caption ||
+      'Mo bai viet de xem them noi dung.',
     140
   ),
   type: post.type,
@@ -531,58 +556,10 @@ const mapSearchResultPost = (post) => ({
   },
 });
 
-const legacyBuildSearchResponse = async ({ query, topics, offset = 0 }) => {
-  const { posts, total, hasMore, nextOffset } = await searchPostsByTopics(
-    topics,
-    offset,
-    SEARCH_PAGE_SIZE
-  );
-
-  if (!posts.length) {
-    return {
-      replyText:
-        offset > 0
-          ? 'Mình đã hết kết quả phù hợp cho lần tìm kiếm này rồi.'
-          : 'Mình chưa tìm thấy bài viết phù hợp. Bạn thử đổi chủ đề hoặc mô tả cụ thể hơn nhé.',
-      botPayload: {
-        type: 'search_results',
-        query,
-        topics,
-        offset,
-        nextOffset: offset,
-        total,
-        hasMore: false,
-        posts: [],
-        suggestions: [],
-      },
-    };
-  }
-
-  return {
-    replyText: hasMore
-      ? `Mình tìm thấy ${Math.min(nextOffset, total)} / ${total} bài viết liên quan đến ${topics.join(
-          ', '
-        )}. Bạn có thể bấm "Xem thêm" để lấy tiếp 3 bài nữa.`
-      : `Mình tìm thấy ${posts.length} bài viết liên quan đến ${topics.join(', ')}.`,
-    botPayload: {
-      type: 'search_results',
-      query,
-      topics,
-      offset,
-      nextOffset,
-      total,
-      hasMore,
-      posts: posts.map(mapSearchResultPost),
-      suggestions: hasMore ? [{ label: 'Xem thêm', prompt: 'Xem thêm' }] : [],
-    },
-  };
-};
-
 const buildSearchResponse = async ({ query, topics, offset = 0 }) => {
-  const { posts, total, hasMore, nextOffset } = await searchPostsByTopics(
+  const { posts, total, hasMore, nextOffset } = await searchPosts(
     { query, topics },
-    offset,
-    SEARCH_PAGE_SIZE
+    offset
   );
   const displayLabel = getSearchDisplayLabel({ query, topics });
 
@@ -590,8 +567,8 @@ const buildSearchResponse = async ({ query, topics, offset = 0 }) => {
     return {
       replyText:
         offset > 0
-          ? 'Minh da het ket qua phu hop cho lan tim kiem nay roi.'
-          : 'Minh chua tim thay bai viet phu hop. Ban thu doi chu de hoac mo ta cu the hon nhe.',
+          ? BOT_REPLY_MESSAGES.noMoreSearchResults
+          : BOT_REPLY_MESSAGES.noSearchResults,
       botPayload: {
         type: 'search_results',
         query,
@@ -608,8 +585,11 @@ const buildSearchResponse = async ({ query, topics, offset = 0 }) => {
 
   return {
     replyText: hasMore
-      ? `Minh tim thay ${Math.min(nextOffset, total)} / ${total} bai viet lien quan den ${displayLabel}. Ban co the bam "Xem them" de lay tiep 3 bai nua.`
-      : `Minh tim thay ${posts.length} bai viet lien quan den ${displayLabel}.`,
+      ? `Mình tìm thấy ${Math.min(
+          nextOffset,
+          total
+        )} / ${total} bài viết liên quan đến ${displayLabel}. Bạn có thể bấm "Xem thêm" để lấy tiếp ${SEARCH_PAGE_SIZE} bài nữa.`
+      : `Mình tìm thấy ${posts.length} bài viết liên quan đến ${displayLabel}.`,
     botPayload: {
       type: 'search_results',
       query,
@@ -619,15 +599,12 @@ const buildSearchResponse = async ({ query, topics, offset = 0 }) => {
       total,
       hasMore,
       posts: posts.map(mapSearchResultPost),
-      suggestions: hasMore ? [{ label: 'Xem thêm', prompt: 'Xem thêm' }] : [],
+      suggestions: hasMore ? [SEARCH_SUGGESTION] : [],
     },
   };
 };
 
-const buildCaptionResponse = async (messageText, captionPrompt) => {
-  const extractedTopic =
-    extractTopicHint(captionPrompt || messageText) || 'chu de ban quan tam';
-  const parsed = await callGeminiJson(`
+const buildCaptionPrompt = (messageText) => `
 Ban la HakoBot, tro ly viet caption bang tieng Viet.
 Hay tao 5 caption ngan gon, tu nhien, da dang giua cam xuc, vui ve va cuon hut.
 Tra ve JSON duy nhat:
@@ -637,8 +614,15 @@ Tra ve JSON duy nhat:
 }
 
 Yeu cau cua nguoi dung:
-${captionPrompt || messageText}
-  `);
+${messageText}
+`;
+
+const buildCaptionResponse = async (messageText, captionPrompt) => {
+  const extractedTopic =
+    extractTopicHint(captionPrompt || messageText) || 'chủ đề bạn quan tâm';
+  const parsed = await callGeminiJson(
+    buildCaptionPrompt(captionPrompt || messageText)
+  );
 
   const suggestions = Array.isArray(parsed?.captions)
     ? parsed.captions
@@ -659,8 +643,7 @@ ${captionPrompt || messageText}
   };
 };
 
-const buildChatResponse = async (messageText) => {
-  const parsed = await callGeminiJson(`
+const buildChatPrompt = (messageText) => `
 Ban la HakoBot, tro ly AI trong he thong Hako Messenger.
 Hay tra loi bang tieng Viet, than thien, ngan gon va huu ich.
 Neu nguoi dung muon tim bai viet hoac goi y caption, co the nhac ho su dung trinh tu tu nhien.
@@ -671,20 +654,80 @@ Tra ve JSON duy nhat:
 
 Tin nhan nguoi dung:
 ${messageText}
-  `);
+`;
+
+const buildChatResponse = async (messageText) => {
+  const parsed = await callGeminiJson(buildChatPrompt(messageText));
 
   return {
     replyText:
       (typeof parsed?.reply === 'string' && parsed.reply.trim()) ||
-      'Mình đây. Bạn có thể nhờ mình gợi ý caption hoặc tìm bài viết theo chủ đề bất kỳ.',
+      BOT_REPLY_MESSAGES.defaultChat,
     botPayload: {
       type: 'chat',
-      suggestions: [
-        { label: 'Gợi ý caption', prompt: 'Gợi ý cho mình vài caption về du lịch' },
-        { label: 'Tìm bài viết', prompt: 'Tìm cho mình bài viết về ẩm thực' },
-      ],
+      suggestions: CHAT_SUGGESTIONS,
     },
   };
+};
+
+const resolveBotResponse = async ({ userId, botId, messageText }) => {
+  const trimmedMessage = String(messageText || '').trim();
+
+  if (!trimmedMessage) {
+    return {
+      replyText: BOT_REPLY_MESSAGES.emptyInput,
+      botPayload: { type: 'chat' },
+    };
+  }
+
+  if (isShowMoreCommand(trimmedMessage)) {
+    const previousSearchContext = await findLatestSearchContext(userId, botId);
+
+    if (previousSearchContext) {
+      return buildSearchResponse(previousSearchContext);
+    }
+
+    return {
+      replyText: BOT_REPLY_MESSAGES.missingSearchContext,
+      botPayload: {
+        type: 'chat',
+        suggestions: [SHOW_MORE_FALLBACK_SUGGESTION],
+      },
+    };
+  }
+
+  const classifiedIntent = await classifyIntentWithGemini(trimmedMessage);
+
+  if (classifiedIntent.intent === 'search') {
+    return buildSearchResponse({
+      query: classifiedIntent.searchQuery || trimmedMessage,
+      topics: classifiedIntent.topics,
+      offset: 0,
+    });
+  }
+
+  if (classifiedIntent.intent === 'caption') {
+    return buildCaptionResponse(
+      trimmedMessage,
+      classifiedIntent.captionPrompt || trimmedMessage
+    );
+  }
+
+  return buildChatResponse(trimmedMessage);
+};
+
+const saveBotReplyMessage = async ({ botUserId, userId, replyText, botPayload }) => {
+  const savedBotMessage = await Message.create({
+    senderId: botUserId,
+    receiverId: userId,
+    message: replyText,
+    botPayload: botPayload || null,
+  });
+
+  return Message.findById(savedBotMessage._id)
+    .populate('senderId', BOT_USER_SELECT_FIELDS)
+    .populate('receiverId', BOT_USER_SELECT_FIELDS)
+    .lean();
 };
 
 export const ensureHakoBotUser = async () => {
@@ -746,159 +789,31 @@ export const ensureHakoBotUser = async () => {
 };
 
 export const isHakoBotReceiver = async (receiverId) => {
-  if (!receiverId) return false;
+  if (!receiverId) {
+    return false;
+  }
+
   const botUser = await ensureHakoBotUser();
   return botUser._id.toString() === receiverId.toString();
 };
 
-const legacyCreateBotReplyMessage = async ({ userId, messageText }) => {
-  const botUser = await ensureHakoBotUser();
-  const trimmedMessage = String(messageText || '').trim();
-
-  let response;
-
-  if (!trimmedMessage) {
-    response = {
-      replyText:
-        'Mình hiện hỗ trợ tốt nhất với tin nhắn văn bản. Bạn thử mô tả chủ đề hoặc yêu cầu cụ thể nhé.',
-      botPayload: {
-        type: 'chat',
-      },
-    };
-  } else if (isShowMoreCommand(trimmedMessage)) {
-    const previousSearchContext = await findLatestSearchContext(
-      userId,
-      botUser._id
-    );
-
-    response = previousSearchContext
-      ? await buildSearchResponse(previousSearchContext)
-      : {
-          replyText:
-            'Bạn hãy yêu cầu mình tìm bài viết trước, ví dụ: "Tìm cho mình bài viết về ẩm thực".',
-          botPayload: {
-            type: 'chat',
-            suggestions: [
-              {
-                label: 'Tìm bài ẩm thực',
-                prompt: 'Tìm cho mình bài viết về ẩm thực',
-              },
-            ],
-          },
-        };
-  } else {
-    const classifiedIntent = await classifyIntentWithGemini(trimmedMessage);
-
-    if (classifiedIntent.intent === 'search') {
-      response = true
-        ? await buildSearchResponse({
-            query: classifiedIntent.searchQuery || trimmedMessage,
-            topics: classifiedIntent.topics,
-            offset: 0,
-          })
-        : {
-            replyText:
-              'Mình cần rõ hơn chủ đề bạn muốn tìm. Ví dụ: "Tìm cho mình bài viết về du lịch".',
-            botPayload: {
-              type: 'chat',
-            },
-          };
-    } else if (classifiedIntent.intent === 'caption') {
-      response = await buildCaptionResponse(
-        trimmedMessage,
-        classifiedIntent.captionPrompt || trimmedMessage
-      );
-    } else {
-      response = await buildChatResponse(trimmedMessage);
-    }
-  }
-
-  const savedBotMessage = await Message.create({
-    senderId: botUser._id,
-    receiverId: userId,
-    message: response.replyText,
-    botPayload: response.botPayload || null,
-  });
-
-  const populatedBotMessage = await Message.findById(savedBotMessage._id)
-    .populate('senderId', BOT_USER_SELECT_FIELDS)
-    .populate('receiverId', BOT_USER_SELECT_FIELDS)
-    .lean();
-
-  return {
-    botUser,
-    botMessage: populatedBotMessage,
-  };
-};
-
 export const createBotReplyMessage = async ({ userId, messageText }) => {
   const botUser = await ensureHakoBotUser();
-  const trimmedMessage = String(messageText || '').trim();
-
-  let response;
-
-  if (!trimmedMessage) {
-    response = {
-      replyText:
-        'Minh hien ho tro tot nhat voi tin nhan van ban. Ban thu mo ta chu de hoac yeu cau cu the nhe.',
-      botPayload: {
-        type: 'chat',
-      },
-    };
-  } else if (isShowMoreCommand(trimmedMessage)) {
-    const previousSearchContext = await findLatestSearchContext(
-      userId,
-      botUser._id
-    );
-
-    response = previousSearchContext
-      ? await buildSearchResponse(previousSearchContext)
-      : {
-          replyText:
-            'Ban hay yeu cau minh tim bai viet truoc, vi du: "Tim cho minh bai viet ve am thuc".',
-          botPayload: {
-            type: 'chat',
-            suggestions: [
-              {
-                label: 'Tim bai am thuc',
-                prompt: 'Tim cho minh bai viet ve am thuc',
-              },
-            ],
-          },
-        };
-  } else {
-    const classifiedIntent = await classifyIntentWithGemini(trimmedMessage);
-
-    if (classifiedIntent.intent === 'search') {
-      response = await buildSearchResponse({
-        query: classifiedIntent.searchQuery || trimmedMessage,
-        topics: classifiedIntent.topics,
-        offset: 0,
-      });
-    } else if (classifiedIntent.intent === 'caption') {
-      response = await buildCaptionResponse(
-        trimmedMessage,
-        classifiedIntent.captionPrompt || trimmedMessage
-      );
-    } else {
-      response = await buildChatResponse(trimmedMessage);
-    }
-  }
-
-  const savedBotMessage = await Message.create({
-    senderId: botUser._id,
-    receiverId: userId,
-    message: response.replyText,
-    botPayload: response.botPayload || null,
+  const response = await resolveBotResponse({
+    userId,
+    botId: botUser._id,
+    messageText,
   });
 
-  const populatedBotMessage = await Message.findById(savedBotMessage._id)
-    .populate('senderId', BOT_USER_SELECT_FIELDS)
-    .populate('receiverId', BOT_USER_SELECT_FIELDS)
-    .lean();
+  const botMessage = await saveBotReplyMessage({
+    botUserId: botUser._id,
+    userId,
+    replyText: response.replyText,
+    botPayload: response.botPayload,
+  });
 
   return {
     botUser,
-    botMessage: populatedBotMessage,
+    botMessage,
   };
 };
