@@ -2,16 +2,16 @@ import { generateRandomUser, FAKE_USERS } from './buffAdmin.js';
 
 // Một số caption tiếng Việt tự nhiên
 const captions = [
-  'Một ngày đẹp trời để đăng ảnh!',
-  'Chill cùng bạn bè cuối tuần.',
-  'Cà phê sáng và nắng nhẹ.',
-  'Đi đâu cũng được, miễn là cùng nhau.',
-  'Thích cảm giác bình yên như thế này.',
-  'Cuộc sống là những chuyến đi.',
-  'Hôm nay trời nhẹ lên cao.',
-  'Mỗi ngày là một niềm vui mới.',
-  'Thử thách bản thân với điều mới.',
-  'Chỉ cần mỉm cười, mọi chuyện sẽ ổn.',
+  '[bài viết ảo]Một ngày đẹp trời để đăng ảnh!',
+  '[bài viết ảo]Chill cùng bạn bè cuối tuần.',
+  '[bài viết ảo]Cà phê sáng và nắng nhẹ.',
+  '[bài viết ảo]Đi đâu cũng được, miễn là cùng nhau.',
+  '[bài viết ảo]Thích cảm giác bình yên như thế này.',
+  '[bài viết ảo]Cuộc sống là những chuyến đi.',
+  '[bài viết ảo]Hôm nay trời nhẹ lên cao.',
+  '[bài viết ảo]Mỗi ngày là một niềm vui mới.',
+  '[bài viết ảo]Thử thách bản thân với điều mới.',
+  '[bài viết ảo]Chỉ cần mỉm cười, mọi chuyện sẽ ổn.',
 ];
 
 // Danh sách ảnh dự phòng
