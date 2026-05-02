@@ -58,7 +58,7 @@ A robust, scalable RESTful API and WebSocket server built with Express.js 5, Mon
 ## 📁 Project Structure
 
 ```
-bach-end/
+back-end/
 ├── config/                 # Configuration files
 │   ├── db.config.js       # MongoDB connection configuration
 │   └── cloudinary.config.js # Cloudinary configuration
@@ -142,7 +142,7 @@ bach-end/
 
 ```bash
 # Clone the repository
-git clone git@github.com:khoatnn/HAKO_BackEnd.git
+git clone https://github.com/tnnkhoa3006/HAKO-BACKEND.git
 cd HAKO_BackEnd
 
 # Install dependencies
@@ -370,9 +370,9 @@ Copyright © 2025 khoatnn. All rights reserved.
 
 **khoatnn**
 
-- 📧 Email: [tokhoatnn@gmail.com](mailto:tokhoatnn@gmail.com)
-- 📘 Facebook: [khoatnn63](https://www.facebook.com/khoatnn63/)
-- 💻 GitHub: [@khoatnn](https://github.com/khoatnn)
+- 📧 Email: [khoat0360@gmail.com](mailto:khoat0360@gmail.com)
+- 📘 Facebook: [khoatran](https://www.facebook.com/khoatnn63/)
+- 💻 GitHub: [@khoatnn](https://github.com/tnnkhoa3006)
 
 ---
 
